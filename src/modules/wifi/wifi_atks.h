@@ -53,4 +53,11 @@ void beaconAttack();
 
 void deauthFloodAttack();
 
+void resetGlobalState();
+
+bool wifi_atk_setWifi();
+
+bool wifi_atk_unsetWifi();
+
+void wifi_complete_cleanup();
 #endif

@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <globals.h>
 #include <nvs_flash.h>
+#include "wifi_wpspixie.h"
 
 #define WIFI_ATK_NAME "BruceAttack"
 extern bool showHiddenNetworks;
@@ -284,6 +285,7 @@ void wifi_atk_menu() {
         {"Target Atks",  [&]() { scanAtks = true; }    },
 #ifndef LITE_VERSION
         {"Karma Attack", [=]() { karma_setup(); }      },
+        {"WPS Attacks",   [&]() { wps_attack_menu(); } },
 #endif
         {"Beacon SPAM",  [=]() { beaconAttack(); }     },
         {"Deauth Flood", [=]() { deauthFloodAttack(); }},
@@ -445,6 +447,28 @@ ScanNets:
 uint8_t targetBssid[6]; // Just the target AP MAC to pass onto sniff.cpp to filter out EAPOL frames of
                         // unrelated APs
 #if !defined(LITE_VERSION)
+static std::vector<String> vulnerableModels;
+
+void loadVulnerableList() {
+    vulnerableModels.clear();
+    FS *fs = nullptr;
+    if (setupSdCard()) fs = &SD;
+    else fs = &LittleFS;
+
+    if (fs && fs->exists("/vulnwsc.txt")) {
+        File f = fs->open("/vulnwsc.txt", FILE_READ);
+        if (f) {
+            while (f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if (line.length() > 0) vulnerableModels.push_back(line);
+            }
+            f.close();
+            Serial.printf("Loaded %d vulnerable models\n", vulnerableModels.size());
+        }
+    }
+}
+
 void capture_handshake(String tssid, String mac, uint8_t channel) {
 
     // Stop WebUI before setting WiFi mode for handshake capture
@@ -583,7 +607,7 @@ void capture_handshake(String tssid, String mac, uint8_t channel) {
     wifi_complete_cleanup();
     delay(100);
 
-    if (!WiFi.mode(WIFI_MODE_STA)) {
+    if (!WiFi.mode(WIFI_MODE_APSTA)) {
         displayError("Failed starting WIFI", true);
         return;
     }

@@ -42,6 +42,7 @@
 #include <SdFat.h>
 #endif
 #include "modules/wifi/wifi_atks.h" // to use deauth frames and cmds
+#include "wifi_wpspixie.h"
 
 //===== SETTINGS =====//
 #define FILENAME "raw_"
@@ -92,6 +93,7 @@ const size_t SNIFFER_QUEUE_DEPTH = 48;
 std::set<uint64_t> handshakeReadyBssids;
 portMUX_TYPE handshakeReadyMux = portMUX_INITIALIZER_UNLOCKED;
 std::set<uint64_t> handshakeBeaconLogged;
+// pixieCapture is defined in wifi_wpspixie.cpp, declared extern in wifi_wpspixie.h
 
 // --- New globals for beacon last-seen tracking & cleanup ---
 std::map<uint64_t, uint32_t> beaconLastSeen; // key = macToKey(mac) -> last seen millis()
@@ -134,7 +136,6 @@ static void copyMac(uint8_t *dest, const uint8_t *src);
 static String extractSsid(const wifi_promiscuous_pkt_t *packet);
 static void copySsidToBuffer(const String &ssid, char *buffer, size_t len);
 static String sanitizeSsid(const char *ssid);
-static String macToHex(const uint8_t *mac);
 static String buildHandshakePath(const uint8_t *mac, const char *ssid);
 static bool handshakeFileExists(const String &path);
 static bool shouldSaveBeaconForHandshake(const uint8_t *mac);
@@ -210,6 +211,141 @@ bool isItEAPOL(const wifi_promiscuous_pkt_t *packet) {
     return false;
 }
 
+bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
+    // FIX: WPS M1-M7 messages are EAP packets (EAPOL type 0x00), NOT EAPOL-Key (0x03).
+    // The Expanded EAP type (0xFE) with Wi-Fi Alliance WSC Vendor-ID/Type identifies WPS.
+    if (!pkt) return false;
+    const uint8_t *p   = pkt->payload;
+    const int      len = (int)pkt->rx_ctrl.sig_len;
+
+    int offset = 24;
+    if ((p[0] & 0x0F) == 0x08) offset += 2;  // QoS subtype
+
+    // Need: LLC/SNAP(8) + EAPOL-hdr(4) + EAP-hdr(5) + Expanded(7) = 24
+    if (offset + 24 > len) return false;
+
+    // LLC/SNAP must signal EAPOL (88 8E)
+    if (p[offset]   != 0xAA || p[offset+1] != 0xAA ||
+        p[offset+2] != 0x03 || p[offset+3] != 0x00 ||
+        p[offset+4] != 0x00 || p[offset+5] != 0x00 ||
+        p[offset+6] != 0x88 || p[offset+7] != 0x8E) return false;
+    offset += 8;
+
+    // EAPOL type must be 0x00 (EAP Packet) – WPS never uses EAPOL-Key for M1-M7
+    if (p[offset + 1] != 0x00) return false;
+    offset += 4;  // past EAPOL header
+
+    // EAP type must be 0xFE (Expanded NAK / WSC)
+    if (offset + 5 > len) return false;
+    if (p[offset + 4] != 0xFE) return false;  // EAP type byte
+    offset += 5;
+
+    // Wi-Fi Alliance WSC Vendor-ID: 00 37 2A, Vendor-Type: 00 00 00 01
+    if (offset + 7 > len) return false;
+    if (p[offset]   != 0x00 || p[offset+1] != 0x37 || p[offset+2] != 0x2A) return false;
+    if (p[offset+3] != 0x00 || p[offset+4] != 0x00 ||
+        p[offset+5] != 0x00 || p[offset+6] != 0x01) return false;
+
+    return true;
+}
+
+
+// Parse WPS frames for Pixie Dust data
+bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
+    // FIX: Recalculate offset to skip the correct headers before WPS TLV attributes:
+    //   802.11 MAC (24 or 26) + LLC/SNAP (8) + EAPOL-hdr (4) + EAP-hdr (5)
+    //   + Expanded prefix: Vendor-ID(3)+Vendor-Type(4) + Op-Code(1) + Flags(1) = 26 extra
+    //   Optional: 2-byte Message-Length when fragmentation flag set
+    if (!isWpsFrame(pkt)) return false;
+    const uint8_t *p   = pkt->payload;
+    const int      len = (int)pkt->rx_ctrl.sig_len;
+
+    int offset = 24;
+    if ((p[0] & 0x0F) == 0x08) offset += 2;  // QoS
+
+    offset += 8;   // LLC/SNAP
+    offset += 4;   // EAPOL header
+    offset += 5;   // EAP header (code, id, length, type)
+    offset += 7;   // Expanded Vendor-ID(3) + Vendor-Type(4)
+
+    if (offset + 2 > len) return false;
+    /* uint8_t opcode = p[offset]; */ offset++;  // Op-Code (unused but must skip)
+    uint8_t flags  = p[offset];   offset++;  // Flags
+
+    // If Message-Length flag (bit 0) is set, skip the 2-byte total length field
+    if (flags & 0x01) offset += 2;
+
+    // Walk WPS TLV attributes
+    while (offset + 4 <= len) {
+        uint16_t attr_type = ((uint16_t)p[offset] << 8) | p[offset+1];
+        uint16_t attr_len  = ((uint16_t)p[offset+2] << 8) | p[offset+3];
+        offset += 4;
+        if (offset + attr_len > len) break;
+
+        const uint8_t *data = p + offset;
+
+        switch (attr_type) {
+            case 0x1022:  // Enrollee Public Key
+                if (attr_len == 192) {
+                    memcpy(pixieCapture.pke, data, 192);
+                    if (Serial) Serial.println("[Pixie] PKE captured");
+                }
+                break;
+            case 0x1023:  // Registrar Public Key
+                if (attr_len == 192) {
+                    memcpy(pixieCapture.pkr, data, 192);
+                    if (Serial) Serial.println("[Pixie] PKR captured");
+                }
+                break;
+            case 0x1032:  // Enrollee Nonce
+                if (attr_len == 16) {
+                    memcpy(pixieCapture.e_nonce, data, 16);
+                    if (Serial) Serial.println("[Pixie] E-Nonce captured");
+                }
+                break;
+            case 0x103A:  // Registrar Nonce
+                if (attr_len == 16) {
+                    memcpy(pixieCapture.r_nonce, data, 16);
+                    if (Serial) Serial.println("[Pixie] R-Nonce captured");
+                }
+                break;
+            case 0x1062:  // E-Hash1
+                if (attr_len == 32) {
+                    memcpy(pixieCapture.e_hash1, data, 32);
+                    if (Serial) Serial.println("[Pixie] E-Hash1 captured");
+                }
+                break;
+            case 0x1063:  // E-Hash2
+                if (attr_len == 32) {
+                    memcpy(pixieCapture.e_hash2, data, 32);
+                    if (Serial) Serial.println("[Pixie] E-Hash2 captured");
+                }
+                break;
+            case 0x1008:  // Authenticator (closest proxy for AuthKey available OTA)
+                if (attr_len == 32) {
+                    memcpy(pixieCapture.authkey, data, 32);
+                    if (Serial) Serial.println("[Pixie] AuthKey captured");
+                }
+                break;
+        }
+
+        offset += attr_len;
+    }
+
+    // Minimum required fields for pixiewps; authkey is optional (not always visible OTA)
+    bool hasMinimal =
+        pixieCapture.pke[0]     != 0 &&
+        pixieCapture.pkr[0]     != 0 &&
+        pixieCapture.e_hash1[0] != 0 &&
+        pixieCapture.e_hash2[0] != 0 &&
+        pixieCapture.e_nonce[0] != 0;
+
+    if (hasMinimal && !pixieCapture.valid) {
+        pixieCapture.valid = true;
+        if (Serial) Serial.println("[Pixie] *** Minimum Pixie Dust data captured ***");
+    }
+    return hasMinimal;
+}
 HandshakeTracker hsTracker;
 
 bool handshakeUsable(const HandshakeTracker &hs) { // EAPOL Messages needed: 1+2 or 3+4
@@ -334,14 +470,6 @@ static String sanitizeSsid(const char *ssid) {
     }
     if (sanitized.length() == 0) { sanitized = "UNKNOWN"; }
     return sanitized;
-}
-
-static String macToHex(const uint8_t *mac) {
-    char buffer[13] = {0};
-    snprintf(
-        buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
-    return String(buffer);
 }
 
 static bool handshakeFileExists(const String &path) { return handshakeRecordExists(path); }
@@ -804,8 +932,17 @@ void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
     packet_counter++;
 
     FrameInfo frameInfo = analyzeFrame(pkt);
+
+    // WPS Pixie Dust capture – parse unconditionally for WPS frames.
+    // FIX: do NOT increment num_EAPOL here; the frameInfo.isEapol path below
+    // handles ALL EAPOL frames (WPS frames are a subset of EAPOL), so incrementing
+    // in both places caused a double-count that confused the capture UI.
+    if (isWpsFrame(pkt)) {
+        parseWpsPixieData(pkt);
+    }
+
     if (!frameInfo.valid) { return; }
-    if (frameInfo.isEapol) { num_EAPOL++; }
+    if (frameInfo.isEapol) { num_EAPOL++; }  // single increment for all EAPOL / WPS frames
 
     bool saveRaw = rawCaptureEnabled();
     bool saveHandshake =
@@ -844,6 +981,7 @@ void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
         portYIELD_FROM_ISR();
     }
 }
+
 
 // esp_err_t event_handler(void *ctx, system_event_t *event){ return ESP_OK; }
 void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -945,6 +1083,7 @@ static std::vector<String> recentSsidsOnChannel(uint8_t channel, size_t maxItems
     }
     return out;
 }
+
 
 //===== SETUP =====//
 void sniffer_setup() {
