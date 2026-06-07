@@ -601,9 +601,9 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     putTlv(0x1022, msgType,        sizeof(msgType));        // Message Type = M1
     putTlv(0x1047, uuid,           sizeof(uuid));           // UUID-E
     putTlv(0x1020, macAddr,        sizeof(macAddr));        // MAC Address
-    putTlv(0x1032, eNonce,         16);                     // Enrollee Nonce
-    putTlv(0x1028, pke,            192);                    // Enrollee Public Key
-    putTlv(0x1010, authTypeFlags,  sizeof(authTypeFlags));  // Auth Type Flags
+    putTlv(0x101C, eNonce,         16);                     // Enrollee Nonce
+    putTlv(0x1032, pke,            192);                    // Enrollee Public Key
+    putTlv(0x1004, authTypeFlags,  sizeof(authTypeFlags));  // Auth Type Flags
     putTlv(0x100D, encrTypeFlags,  sizeof(encrTypeFlags));  // Encr Type Flags
     putTlv(0x100E, connTypeFlags,  sizeof(connTypeFlags));  // Connection Type Flags
     putTlv(0x1008, configMethods,  sizeof(configMethods));  // Config Methods
@@ -612,7 +612,7 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     putTlv(0x103C, rfBands,        sizeof(rfBands));        // RF Bands
     putTlv(0x1002, assocState,     sizeof(assocState));     // Association State
     putTlv(0x1009, configError,    sizeof(configError));    // Config Error (FIX: was 0x1004)
-    putTlv(0x1053, osVersion,      sizeof(osVersion));      // OS Version
+    putTlv(0x102E, osVersion,      sizeof(osVersion));      // OS Version
     putTlv(0x1054, primaryDevType, sizeof(primaryDevType)); // Primary Device Type (FIX: was 0x103B)
     putTlv(0x1021, (const uint8_t*)manufacturer, (uint16_t)strlen(manufacturer)); // Manufacturer (FIX: was 0x1011)
     putTlv(0x1023, (const uint8_t*)modelName,    (uint16_t)strlen(modelName));    // Model Name (FIX: was 0x1021)
